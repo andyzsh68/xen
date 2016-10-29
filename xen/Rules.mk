@@ -61,7 +61,7 @@ CFLAGS += -Werror -Wredundant-decls -Wno-pointer-arith
 $(call cc-option-add,CFLAGS,CC,-Wvla)
 CFLAGS += -pipe -D__XEN__ -include $(BASEDIR)/include/xen/config.h
 CFLAGS-$(CONFIG_DEBUG_INFO) += -g
-CFLAGS += '-D__OBJECT_FILE__="$@"'
+CFLAGS += -U__OBJECT_FILE__ '-D__OBJECT_FILE__="$@"'
 
 ifneq ($(clang),y)
 # Clang doesn't understand this command line argument, and doesn't appear to
