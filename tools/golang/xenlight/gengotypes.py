@@ -39,7 +39,7 @@ def xenlight_golang_generate_types(path = None, types = None, comment = None):
     with open(path, 'w') as f:
         if comment is not None:
             f.write(comment)
-        f.write('package xenlight\n')
+        f.write('package xenlight\n\n')
 
         for ty in types:
             (tdef, extras) = xenlight_golang_type_define(ty)
@@ -51,8 +51,6 @@ def xenlight_golang_generate_types(path = None, types = None, comment = None):
             for extra in extras:
                 f.write(extra)
                 f.write('\n')
-
-    go_fmt(path)
 
 def xenlight_golang_type_define(ty = None):
     """
@@ -205,7 +203,7 @@ def xenlight_golang_generate_helpers(path = None, types = None, comment = None):
     with open(path, 'w') as f:
         if comment is not None:
             f.write(comment)
-        f.write('package xenlight\n')
+        f.write('package xenlight\n\n')
         f.write('import (\n"unsafe"\n"errors"\n"fmt"\n)\n')
 
         # Cgo preamble
@@ -240,14 +238,12 @@ def xenlight_golang_generate_helpers(path = None, types = None, comment = None):
             f.write(xenlight_golang_define_to_C(ty))
             f.write('\n')
 
-    go_fmt(path)
-
 def xenlight_golang_define_from_C(ty = None):
     """
     Define the fromC marshaling function for the type
     represented by ty.
     """
-    func = 'func (x *{}) fromC(xc *C.{}) error {{\n {} \n return nil}}\n'
+    func = 'func (x *{}) fromC(xc *C.{}) error {{\n {}\n return nil}}\n'
 
     goname = xenlight_golang_fmt_name(ty.typename)
     cname  = ty.typename
@@ -317,7 +313,7 @@ def xenlight_golang_convert_from_C(ty = None, outer_name = None, cvarname = None
         # If the type is not castable, we need to call its fromC
         # function.
         s += 'if err := x.{}.fromC(&{}.{});'.format(goname,cvarname,cname)
-        s += 'err != nil {{\nreturn fmt.Errorf("converting field {}: %v", err) \n}}\n'.format(goname)
+        s += 'err != nil {{\nreturn fmt.Errorf("converting field {}: %v", err)\n}}\n'.format(goname)
 
     elif gotypename == 'string':
         # Use the cgo helper for converting C strings.
@@ -383,7 +379,7 @@ def xenlight_golang_union_from_C(ty = None, union_name = '', struct_name = ''):
 
     # Create switch statement to determine which 'union element'
     # to populate in the Go struct.
-    for case_name, case_tuple in cases.items():
+    for case_name, case_tuple in sorted(cases.items()):
         (case_val, case_type) = case_tuple
 
         s += 'case {}:\n'.format(case_val)
@@ -399,7 +395,7 @@ def xenlight_golang_union_from_C(ty = None, union_name = '', struct_name = ''):
 
         s += 'var {} {}\n'.format(goname, gotype)
         s += 'if err := {}.fromC(xc);'.format(goname)
-        s += 'err != nil {{\n return fmt.Errorf("converting field {}: %v", err) \n}}\n'.format(goname)
+        s += 'err != nil {{\n return fmt.Errorf("converting field {}: %v", err)\n}}\n'.format(goname)
 
         s += 'x.{} = {}\n'.format(field_name, goname)
 
@@ -426,13 +422,12 @@ def xenlight_golang_array_from_C(ty = None):
     cname      = ty.name
     cslice     = 'c{}'.format(goname)
     clenvar    = ty.type.lenvar.name
-    golenvar   = xenlight_golang_fmt_name(clenvar,exported=False)
 
-    s += '{} := int(xc.{})\n'.format(golenvar, clenvar)
+    s += 'x.{} = nil\n'.format(goname)
+    s += 'if n := int(xc.{}); n > 0 {{\n'.format(clenvar)
     s += '{} := '.format(cslice)
-    s +='(*[1<<28]C.{})(unsafe.Pointer(xc.{}))[:{}:{}]\n'.format(ctypename, cname,
-                                                                golenvar, golenvar)
-    s += 'x.{} = make([]{}, {})\n'.format(goname, gotypename, golenvar)
+    s +='(*[1<<28]C.{})(unsafe.Pointer(xc.{}))[:n:n]\n'.format(ctypename, cname)
+    s += 'x.{} = make([]{}, n)\n'.format(goname, gotypename)
     s += 'for i, v := range {} {{\n'.format(cslice)
 
     is_enum = isinstance(ty.type.elem_type,idl.Enumeration)
@@ -442,7 +437,7 @@ def xenlight_golang_array_from_C(ty = None):
         s += 'if err := x.{}[i].fromC(&v); err != nil {{\n'.format(goname)
         s += 'return fmt.Errorf("converting field {}: %v", err) }}\n'.format(goname)
 
-    s += '}\n'
+    s += '}\n}\n'
 
     return s
 
@@ -451,7 +446,7 @@ def xenlight_golang_define_to_C(ty = None, typename = None, nested = False):
     Define the toC marshaling function for the type
     represented by ty.
     """
-    func = 'func (x *{}) toC(xc *C.{}) (err error){{{}\n return nil \n }}\n'
+    func = 'func (x *{}) toC(xc *C.{}) (err error){{{}\n return nil\n }}\n'
     body = ''
 
     if ty.dispose_fn is not None:
@@ -521,7 +516,7 @@ def xenlight_golang_convert_to_C(ty = None, outer_name = None,
     if not is_castable:
         s += 'if err := {}.{}.toC(&{}.{}); err != nil {{\n'.format(govarname,goname,
                                                                    cvarname,cname)
-        s += 'return fmt.Errorf("converting field {}: %v", err) \n}}\n'.format(goname)
+        s += 'return fmt.Errorf("converting field {}: %v", err)\n}}\n'.format(goname)
 
     elif gotypename == 'string':
         # Use the cgo helper for converting C strings.
@@ -626,7 +621,7 @@ def xenlight_golang_array_to_C(ty = None):
                                                                          golenvar,golenvar)
     s += 'for i,v := range x.{} {{\n'.format(goname)
     s += 'if err := v.toC(&c{}[i]); err != nil {{\n'.format(goname)
-    s += 'return fmt.Errorf("converting field {}: %v", err) \n'.format(goname)
+    s += 'return fmt.Errorf("converting field {}: %v", err)\n'.format(goname)
     s += '}\n}\n}\n'
 
     return s
@@ -720,10 +715,6 @@ def xenlight_golang_fmt_name(name, exported = True):
 
     return words[0] + ''.join(x.title() for x in words[1:])
 
-def go_fmt(path):
-    """ Call go fmt on the given path. """
-    os.system('go fmt {}'.format(path))
-
 if __name__ == '__main__':
     idlname = sys.argv[1]
 
@@ -734,11 +725,12 @@ if __name__ == '__main__':
         builtin_type_names[name] = xenlight_golang_fmt_name(name)
 
     header_comment="""// DO NOT EDIT.
-    //
-    // This file is generated by:
-    // {}
-    //
-    """.format(' '.join(sys.argv))
+//
+// This file is generated by:
+// {}
+//
+
+""".format(' '.join(sys.argv))
 
     xenlight_golang_generate_types(types=types,
                                    comment=header_comment)

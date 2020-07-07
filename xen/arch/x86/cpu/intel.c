@@ -297,6 +297,41 @@ static void early_init_intel(struct cpuinfo_x86 *c)
 }
 
 /*
+ * Errata BA80, AAK120, AAM108, AAO67, BD59, AAY54: Rapid Core C3/C6 Transition
+ * May Cause Unpredictable System Behavior
+ *
+ * Under a complex set of internal conditions, cores rapidly performing C3/C6
+ * transitions in a system with Intel Hyper-Threading Technology enabled may
+ * cause a machine check error (IA32_MCi_STATUS.MCACOD = 0x0106), system hang
+ * or unpredictable system behavior.
+ */
+static void probe_c3_errata(const struct cpuinfo_x86 *c)
+{
+#define INTEL_FAM6_MODEL(m) { X86_VENDOR_INTEL, 6, m, X86_FEATURE_ALWAYS }
+    static const struct x86_cpu_id models[] = {
+        /* Nehalem */
+        INTEL_FAM6_MODEL(0x1a),
+        INTEL_FAM6_MODEL(0x1e),
+        INTEL_FAM6_MODEL(0x1f),
+        INTEL_FAM6_MODEL(0x2e),
+        /* Westmere (note Westmere-EX is not affected) */
+        INTEL_FAM6_MODEL(0x2c),
+        INTEL_FAM6_MODEL(0x25),
+        { }
+    };
+#undef INTEL_FAM6_MODEL
+
+    /* Serialized by the AP bringup code. */
+    if ( max_cstate > 1 && (c->apicid & (c->x86_num_siblings - 1)) &&
+         x86_match_cpu(models) )
+    {
+        printk(XENLOG_WARNING
+	       "Disabling C-states C3 and C6 due to CPU errata\n");
+        max_cstate = 1;
+    }
+}
+
+/*
  * P4 Xeon errata 037 workaround.
  * Hardware prefetcher may cause stale data to be loaded into the cache.
  *
@@ -323,6 +358,8 @@ static void Intel_errata_workarounds(struct cpuinfo_x86 *c)
 
 	if (cpu_has_tsx_force_abort && opt_rtm_abort)
 		wrmsrl(MSR_TSX_FORCE_ABORT, TSX_FORCE_ABORT_RTM);
+
+	probe_c3_errata(c);
 }
 
 
@@ -342,6 +379,76 @@ static int num_cpu_cores(struct cpuinfo_x86 *c)
 		return ((eax >> 26) + 1);
 	else
 		return 1;
+}
+
+static void intel_log_freq(const struct cpuinfo_x86 *c)
+{
+    unsigned int eax, ebx, ecx, edx;
+    uint64_t msrval;
+    uint8_t max_ratio;
+
+    if ( c->cpuid_level >= 0x15 )
+    {
+        cpuid(0x15, &eax, &ebx, &ecx, &edx);
+        if ( ecx && ebx && eax )
+        {
+            unsigned long long val = ecx;
+
+            val *= ebx;
+            do_div(val, eax);
+            printk("CPU%u: TSC: %uMHz * %u / %u = %LuMHz\n",
+                   smp_processor_id(), ecx, ebx, eax, val);
+        }
+        else if ( ecx | eax | ebx )
+        {
+            printk("CPU%u: TSC:", smp_processor_id());
+            if ( ecx )
+                printk(" core: %uMHz", ecx);
+            if ( ebx && eax )
+                printk(" ratio: %u / %u", ebx, eax);
+            printk("\n");
+        }
+    }
+
+    if ( c->cpuid_level >= 0x16 )
+    {
+        cpuid(0x16, &eax, &ebx, &ecx, &edx);
+        if ( ecx | eax | ebx )
+        {
+            printk("CPU%u:", smp_processor_id());
+            if ( ecx )
+                printk(" bus: %uMHz", ecx);
+            if ( eax )
+                printk(" base: %uMHz", eax);
+            if ( ebx )
+                printk(" max: %uMHz", ebx);
+            printk("\n");
+        }
+    }
+
+    if ( rdmsr_safe(MSR_INTEL_PLATFORM_INFO, msrval) )
+        return;
+    max_ratio = msrval >> 8;
+
+    if ( max_ratio )
+    {
+        unsigned int factor = 10000;
+        uint8_t min_ratio = msrval >> 40;
+
+        if ( c->x86 == 6 )
+            switch ( c->x86_model )
+            {
+            case 0x1a: case 0x1e: case 0x1f: case 0x2e: /* Nehalem */
+            case 0x25: case 0x2c: case 0x2f: /* Westmere */
+                factor = 13333;
+                break;
+            }
+
+        printk("CPU%u: ", smp_processor_id());
+        if ( min_ratio )
+            printk("%u..", (factor * min_ratio + 50) / 100);
+        printk("%u MHz\n", (factor * max_ratio + 50) / 100);
+    }
 }
 
 static void init_intel(struct cpuinfo_x86 *c)
@@ -378,6 +485,10 @@ static void init_intel(struct cpuinfo_x86 *c)
 	     ( c->cpuid_level >= 0x00000006 ) &&
 	     ( cpuid_eax(0x00000006) & (1u<<2) ) )
 		__set_bit(X86_FEATURE_ARAT, c->x86_capability);
+
+	if ((opt_cpu_info && !(c->apicid & (c->x86_num_siblings - 1))) ||
+	    c == &boot_cpu_data )
+		intel_log_freq(c);
 }
 
 const struct cpu_dev intel_cpu_dev = {

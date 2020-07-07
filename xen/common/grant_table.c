@@ -85,8 +85,43 @@ struct grant_table {
     struct grant_table_arch arch;
 };
 
-static int parse_gnttab_limit(const char *param, const char *arg,
-                              unsigned int *valp)
+unsigned int __read_mostly opt_max_grant_frames = 64;
+static unsigned int __read_mostly opt_max_maptrack_frames = 1024;
+
+#ifdef CONFIG_HYPFS
+#define GRANT_CUSTOM_VAL_SZ  12
+static char __read_mostly opt_max_grant_frames_val[GRANT_CUSTOM_VAL_SZ];
+static char __read_mostly opt_max_maptrack_frames_val[GRANT_CUSTOM_VAL_SZ];
+
+static void update_gnttab_par(unsigned int val, struct param_hypfs *par,
+                              char *parval)
+{
+    snprintf(parval, GRANT_CUSTOM_VAL_SZ, "%u", val);
+    custom_runtime_set_var_sz(par, parval, GRANT_CUSTOM_VAL_SZ);
+}
+
+static void __init gnttab_max_frames_init(struct param_hypfs *par)
+{
+    update_gnttab_par(opt_max_grant_frames, par, opt_max_grant_frames_val);
+}
+
+static void __init max_maptrack_frames_init(struct param_hypfs *par)
+{
+    update_gnttab_par(opt_max_maptrack_frames, par,
+                      opt_max_maptrack_frames_val);
+}
+#else
+#define update_gnttab_par(v, unused1, unused2)     update_gnttab_par(v)
+#define parse_gnttab_limit(a, v, unused1, unused2) parse_gnttab_limit(a, v)
+
+static void update_gnttab_par(unsigned int val, struct param_hypfs *par,
+                              char *parval)
+{
+}
+#endif
+
+static int parse_gnttab_limit(const char *arg, unsigned int *valp,
+                              struct param_hypfs *par, char *parval)
 {
     const char *e;
     unsigned long val;
@@ -99,28 +134,33 @@ static int parse_gnttab_limit(const char *param, const char *arg,
         return -ERANGE;
 
     *valp = val;
+    update_gnttab_par(val, par, parval);
 
     return 0;
 }
 
-unsigned int __read_mostly opt_max_grant_frames = 64;
+static int parse_gnttab_max_frames(const char *arg);
+custom_runtime_param("gnttab_max_frames", parse_gnttab_max_frames,
+                     gnttab_max_frames_init);
 
 static int parse_gnttab_max_frames(const char *arg)
 {
-    return parse_gnttab_limit("gnttab_max_frames", arg,
-                              &opt_max_grant_frames);
+    return parse_gnttab_limit(arg, &opt_max_grant_frames,
+                              param_2_parfs(parse_gnttab_max_frames),
+                              opt_max_grant_frames_val);
 }
-custom_runtime_param("gnttab_max_frames", parse_gnttab_max_frames);
 
-static unsigned int __read_mostly opt_max_maptrack_frames = 1024;
+static int parse_gnttab_max_maptrack_frames(const char *arg);
+custom_runtime_param("gnttab_max_maptrack_frames",
+                     parse_gnttab_max_maptrack_frames,
+                     max_maptrack_frames_init);
 
 static int parse_gnttab_max_maptrack_frames(const char *arg)
 {
-    return parse_gnttab_limit("gnttab_max_maptrack_frames", arg,
-                              &opt_max_maptrack_frames);
+    return parse_gnttab_limit(arg, &opt_max_maptrack_frames,
+                              param_2_parfs(parse_gnttab_max_maptrack_frames),
+                              opt_max_maptrack_frames_val);
 }
-custom_runtime_param("gnttab_max_maptrack_frames",
-                     parse_gnttab_max_maptrack_frames);
 
 #ifndef GNTTAB_MAX_VERSION
 #define GNTTAB_MAX_VERSION 2
@@ -353,7 +393,7 @@ static inline void grant_write_unlock(struct grant_table *gt)
 static inline void gnttab_flush_tlb(const struct domain *d)
 {
     if ( !paging_mode_external(d) )
-        flush_tlb_mask(d->dirty_cpumask);
+        arch_flush_tlb_mask(d->dirty_cpumask);
 }
 
 static inline unsigned int
@@ -3626,12 +3666,12 @@ do_grant_table_op(
         if ( unlikely(!guest_handle_okay(cflush, count)) )
             goto out;
         rc = gnttab_cache_flush(cflush, &opaque_in, count);
-        if ( rc > 0 )
+        if ( rc >= 0 )
         {
             guest_handle_add_offset(cflush, rc);
             uop = guest_handle_cast(cflush, void);
+            opaque_out = opaque_in;
         }
-        opaque_out = opaque_in;
         break;
     }
 
@@ -3641,7 +3681,7 @@ do_grant_table_op(
     }
 
   out:
-    if ( rc > 0 || opaque_out != 0 )
+    if ( rc > 0 || (opaque_out != 0 && rc == 0) )
     {
         /* Adjust rc, see gnttab_copy() for why this is needed. */
         if ( cmd == GNTTABOP_copy )

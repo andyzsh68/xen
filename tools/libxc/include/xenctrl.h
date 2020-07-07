@@ -1226,7 +1226,6 @@ int xc_readconsolering(xc_interface *xch,
                        int clear, int incremental, uint32_t *pindex);
 
 int xc_send_debug_keys(xc_interface *xch, const char *keys);
-int xc_set_parameters(xc_interface *xch, const char *params);
 
 typedef struct xen_sysctl_physinfo xc_physinfo_t;
 typedef struct xen_sysctl_cputopo xc_cputopo_t;
@@ -1793,15 +1792,51 @@ int xc_domain_debug_control(xc_interface *xch,
                             uint32_t vcpu);
 
 #if defined(__i386__) || defined(__x86_64__)
-int xc_cpuid_set(xc_interface *xch,
-                 uint32_t domid,
-                 const unsigned int *input,
-                 const char **config,
-                 char **config_transformed);
+
+/*
+ * CPUID policy data, expressed in the legacy XEND format.
+ *
+ * Policy is an array of strings, 32 chars long:
+ *   policy[0] = eax
+ *   policy[1] = ebx
+ *   policy[2] = ecx
+ *   policy[3] = edx
+ *
+ * The format of the string is the following:
+ *   '1' -> force to 1
+ *   '0' -> force to 0
+ *   'x' -> we don't care (use default)
+ *   'k' -> pass through host value
+ *   's' -> legacy alias for 'k'
+ */
+struct xc_xend_cpuid {
+    union {
+        struct {
+            uint32_t leaf, subleaf;
+        };
+        uint32_t input[2];
+    };
+    char *policy[4];
+};
+
+/*
+ * Make adjustments to the CPUID settings for a domain.
+ *
+ * This path is used in two cases.  First, for fresh boots of the domain, and
+ * secondly for migrate-in/restore of pre-4.14 guests (where CPUID data was
+ * missing from the stream).  The @restore parameter distinguishes these
+ * cases, and the generated policy must be compatible with a 4.13.
+ *
+ * Either pass a full new @featureset (and @nr_features), or adjust individual
+ * features (@pae).
+ *
+ * Then (optionally) apply legacy XEND overrides (@xend) to the result.
+ */
 int xc_cpuid_apply_policy(xc_interface *xch,
-                          uint32_t domid,
+                          uint32_t domid, bool restore,
                           const uint32_t *featureset,
-                          unsigned int nr_features, bool pae);
+                          unsigned int nr_features, bool pae,
+                          const struct xc_xend_cpuid *xend);
 int xc_mca_op(xc_interface *xch, struct xen_mc *mc);
 int xc_mca_op_inject_v2(xc_interface *xch, unsigned int flags,
                         xc_cpumap_t cpumap, unsigned int nr_cpus);
@@ -2231,6 +2266,21 @@ int xc_memshr_range_share(xc_interface *xch,
                           uint32_t client_domain,
                           uint64_t first_gfn,
                           uint64_t last_gfn);
+
+int xc_memshr_fork(xc_interface *xch,
+                   uint32_t source_domain,
+                   uint32_t client_domain,
+                   bool allow_with_iommu,
+                   bool block_interrupts);
+
+/*
+ * Note: this function is only intended to be used on short-lived forks that
+ * haven't yet aquired a lot of memory. In case the fork has a lot of memory
+ * it is likely more performant to create a new fork with xc_memshr_fork.
+ *
+ * With VMs that have a lot of memory this call may block for a long time.
+ */
+int xc_memshr_fork_reset(xc_interface *xch, uint32_t forked_domain);
 
 /* Debug calls: return the number of pages referencing the shared frame backing
  * the input argument. Should be one or greater.

@@ -28,6 +28,19 @@
 #include <asm/iocap.h>
 #include <asm/vm_event.h>
 
+struct hvmemul_cache
+{
+    /* The cache is disabled as long as num_ents > max_ents. */
+    unsigned int num_ents;
+    unsigned int max_ents;
+    struct {
+        paddr_t gpa:PADDR_BITS;
+        unsigned int :BITS_PER_LONG - PADDR_BITS - 8;
+        unsigned int size:8;
+        unsigned long data;
+    } ents[];
+};
+
 static void hvmtrace_io_assist(const ioreq_t *p)
 {
     unsigned int size, event;
@@ -120,6 +133,25 @@ static const struct hvm_io_ops ioreq_server_ops = {
 static const struct hvm_io_handler ioreq_server_handler = {
     .ops = &ioreq_server_ops
 };
+
+/*
+ * Drop all records of in-flight emulation. This is needed whenever a vCPU's
+ * register state may have changed behind the emulator's back.
+ */
+void hvmemul_cancel(struct vcpu *v)
+{
+    struct hvm_vcpu_io *vio = &v->arch.hvm.hvm_io;
+
+    vio->io_req.state = STATE_IOREQ_NONE;
+    vio->io_completion = HVMIO_no_completion;
+    vio->mmio_cache_count = 0;
+    vio->mmio_insn_bytes = 0;
+    vio->mmio_access = (struct npfec){};
+    vio->mmio_retry = false;
+    vio->g2m_ioport = NULL;
+
+    hvmemul_cache_disable(v);
+}
 
 static int hvmemul_do_io(
     bool_t is_mmio, paddr_t addr, unsigned long *reps, unsigned int size,
@@ -1409,6 +1441,47 @@ static int hvmemul_rmw(
     return rc;
 }
 
+static int hvmemul_blk(
+    enum x86_segment seg,
+    unsigned long offset,
+    void *p_data,
+    unsigned int bytes,
+    uint32_t *eflags,
+    struct x86_emulate_state *state,
+    struct x86_emulate_ctxt *ctxt)
+{
+    struct hvm_emulate_ctxt *hvmemul_ctxt =
+        container_of(ctxt, struct hvm_emulate_ctxt, ctxt);
+    unsigned long addr;
+    uint32_t pfec = PFEC_page_present;
+    int rc;
+    void *mapping = NULL;
+
+    rc = hvmemul_virtual_to_linear(
+        seg, offset, bytes, NULL, hvm_access_write, hvmemul_ctxt, &addr);
+    if ( rc != X86EMUL_OKAY || !bytes )
+        return rc;
+
+    if ( x86_insn_is_mem_write(state, ctxt) )
+        pfec |= PFEC_write_access;
+
+    if ( is_x86_system_segment(seg) )
+        pfec |= PFEC_implicit;
+    else if ( hvmemul_ctxt->seg_reg[x86_seg_ss].dpl == 3 )
+        pfec |= PFEC_user_mode;
+
+    mapping = hvmemul_map_linear_addr(addr, bytes, pfec, hvmemul_ctxt);
+    if ( IS_ERR(mapping) )
+        return ~PTR_ERR(mapping);
+    if ( !mapping )
+        return X86EMUL_UNHANDLEABLE;
+
+    rc = x86_emul_blk(mapping, p_data, bytes, eflags, state, ctxt);
+    hvmemul_unmap_linear_addr(mapping, addr, bytes, hvmemul_ctxt);
+
+    return rc;
+}
+
 static int hvmemul_write_discard(
     enum x86_segment seg,
     unsigned long offset,
@@ -1866,12 +1939,17 @@ static int hvmemul_rep_movs(
         rc = HVMTRANS_okay;
     }
     else
+    {
+        unsigned int token = hvmemul_cache_disable(curr);
+
         /*
          * We do a modicum of checking here, just for paranoia's sake and to
          * definitely avoid copying an unitialised buffer into guest address
          * space.
          */
         rc = hvm_copy_from_guest_phys(buf, sgpa, bytes);
+        hvmemul_cache_restore(curr, token);
+    }
 
     if ( rc == HVMTRANS_okay )
         rc = hvm_copy_to_guest_phys(dgpa, buf, bytes, curr);
@@ -2132,8 +2210,14 @@ static int hvmemul_write_cr(
         break;
 
     case 3:
-        rc = hvm_set_cr3(val, true);
+    {
+        bool noflush = hvm_pcid_enabled(current) && (val & X86_CR3_NOFLUSH);
+
+        if ( noflush )
+            val &= ~X86_CR3_NOFLUSH;
+        rc = hvm_set_cr3(val, noflush, true);
         break;
+    }
 
     case 4:
         rc = hvm_set_cr4(val, true);
@@ -2475,6 +2559,7 @@ static const struct x86_emulate_ops hvm_emulate_ops = {
     .write         = hvmemul_write,
     .rmw           = hvmemul_rmw,
     .cmpxchg       = hvmemul_cmpxchg,
+    .blk           = hvmemul_blk,
     .validate      = hvmemul_validate,
     .rep_ins       = hvmemul_rep_ins,
     .rep_outs      = hvmemul_rep_outs,
@@ -2534,6 +2619,19 @@ static int _hvm_emulate_one(struct hvm_emulate_ctxt *hvmemul_ctxt,
     struct hvm_vcpu_io *vio = &curr->arch.hvm.hvm_io;
     int rc;
 
+    /*
+     * Enable caching if it's currently disabled, but leave the cache
+     * untouched if it's already enabled, for re-execution to consume
+     * entries populated by an earlier pass.
+     */
+    if ( vio->cache->num_ents > vio->cache->max_ents )
+    {
+        ASSERT(vio->io_req.state == STATE_IOREQ_NONE);
+        vio->cache->num_ents = 0;
+    }
+    else
+        ASSERT(vio->io_req.state == STATE_IORESP_READY);
+
     hvm_emulate_init_per_insn(hvmemul_ctxt, vio->mmio_insn,
                               vio->mmio_insn_bytes);
 
@@ -2547,6 +2645,7 @@ static int _hvm_emulate_one(struct hvm_emulate_ctxt *hvmemul_ctxt,
     {
         vio->mmio_cache_count = 0;
         vio->mmio_insn_bytes = 0;
+        hvmemul_cache_disable(curr);
     }
     else
     {
@@ -2837,6 +2936,123 @@ void hvm_dump_emulation_state(const char *loglvl, const char *prefix,
            loglvl, prefix, rc, curr, mode_str, cs->sel,
            hvmemul_ctxt->insn_buf_eip, hvmemul_ctxt->insn_buf_bytes,
            hvmemul_ctxt->insn_buf);
+}
+
+int hvmemul_cache_init(struct vcpu *v)
+{
+    /*
+     * No insn can access more than 16 independent linear addresses (AVX512F
+     * scatters/gathers being the worst). Each such linear range can span a
+     * page boundary, i.e. may require two page walks. Account for each insn
+     * byte individually, for simplicity.
+     */
+    const unsigned int nents = (CONFIG_PAGING_LEVELS + 1) *
+                               (MAX_INST_LEN + 16 * 2);
+    struct hvmemul_cache *cache = xmalloc_flex_struct(struct hvmemul_cache,
+                                                      ents, nents);
+
+    if ( !cache )
+        return -ENOMEM;
+
+    /* Cache is disabled initially. */
+    cache->num_ents = nents + 1;
+    cache->max_ents = nents;
+
+    v->arch.hvm.hvm_io.cache = cache;
+
+    return 0;
+}
+
+unsigned int hvmemul_cache_disable(struct vcpu *v)
+{
+    struct hvmemul_cache *cache = v->arch.hvm.hvm_io.cache;
+    unsigned int token = cache->num_ents;
+
+    cache->num_ents = cache->max_ents + 1;
+
+    return token;
+}
+
+void hvmemul_cache_restore(struct vcpu *v, unsigned int token)
+{
+    struct hvmemul_cache *cache = v->arch.hvm.hvm_io.cache;
+
+    ASSERT(cache->num_ents > cache->max_ents);
+    cache->num_ents = token;
+}
+
+bool hvmemul_read_cache(const struct vcpu *v, paddr_t gpa,
+                        void *buffer, unsigned int size)
+{
+    const struct hvmemul_cache *cache = v->arch.hvm.hvm_io.cache;
+    unsigned int i;
+
+    /* Cache unavailable? */
+    if ( !is_hvm_vcpu(v) || cache->num_ents > cache->max_ents )
+        return false;
+
+    while ( size > sizeof(cache->ents->data) )
+    {
+        i = gpa & (sizeof(cache->ents->data) - 1)
+            ? -gpa & (sizeof(cache->ents->data) - 1)
+            : sizeof(cache->ents->data);
+        if ( !hvmemul_read_cache(v, gpa, buffer, i) )
+            return false;
+        gpa += i;
+        buffer += i;
+        size -= i;
+    }
+
+    for ( i = 0; i < cache->num_ents; ++i )
+        if ( cache->ents[i].gpa == gpa && cache->ents[i].size == size )
+        {
+            memcpy(buffer, &cache->ents[i].data, size);
+            return true;
+        }
+
+    return false;
+}
+
+void hvmemul_write_cache(const struct vcpu *v, paddr_t gpa,
+                         const void *buffer, unsigned int size)
+{
+    struct hvmemul_cache *cache = v->arch.hvm.hvm_io.cache;
+    unsigned int i;
+
+    /* Cache unavailable? */
+    if ( !is_hvm_vcpu(v) || cache->num_ents > cache->max_ents )
+        return;
+
+    while ( size > sizeof(cache->ents->data) )
+    {
+        i = gpa & (sizeof(cache->ents->data) - 1)
+            ? -gpa & (sizeof(cache->ents->data) - 1)
+            : sizeof(cache->ents->data);
+        hvmemul_write_cache(v, gpa, buffer, i);
+        gpa += i;
+        buffer += i;
+        size -= i;
+    }
+
+    for ( i = 0; i < cache->num_ents; ++i )
+        if ( cache->ents[i].gpa == gpa && cache->ents[i].size == size )
+        {
+            memcpy(&cache->ents[i].data, buffer, size);
+            return;
+        }
+
+    if ( unlikely(i >= cache->max_ents) )
+    {
+        domain_crash(v->domain);
+        return;
+    }
+
+    cache->ents[i].gpa  = gpa;
+    cache->ents[i].size = size;
+
+    memcpy(&cache->ents[i].data, buffer, size);
+
+    cache->num_ents = i + 1;
 }
 
 /*

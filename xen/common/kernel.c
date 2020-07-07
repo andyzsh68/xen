@@ -13,6 +13,7 @@
 #include <xen/paging.h>
 #include <xen/guest_access.h>
 #include <xen/hypercall.h>
+#include <xen/hypfs.h>
 #include <xsm/xsm.h>
 #include <asm/current.h>
 #include <public/version.h>
@@ -195,11 +196,6 @@ static void __init _cmdline_parse(const char *cmdline)
     parse_params(cmdline, __setup_start, __setup_end);
 }
 
-int runtime_parse(const char *line)
-{
-    return parse_params(line, __param_start, __param_end);
-}
-
 /**
  *    cmdline_parse -- parses the xen command line.
  * If CONFIG_CMDLINE is set, it would be parsed prior to @cmdline.
@@ -372,6 +368,84 @@ void __init do_initcalls(void)
     for ( call = __presmp_initcall_end; call < __initcall_end; call++ )
         (*call)();
 }
+
+#ifdef CONFIG_HYPFS
+static unsigned int __read_mostly major_version;
+static unsigned int __read_mostly minor_version;
+
+static HYPFS_DIR_INIT(buildinfo, "buildinfo");
+static HYPFS_DIR_INIT(compileinfo, "compileinfo");
+static HYPFS_DIR_INIT(version, "version");
+static HYPFS_UINT_INIT(major, "major", major_version);
+static HYPFS_UINT_INIT(minor, "minor", minor_version);
+static HYPFS_STRING_INIT(changeset, "changeset");
+static HYPFS_STRING_INIT(compiler, "compiler");
+static HYPFS_STRING_INIT(compile_by, "compile_by");
+static HYPFS_STRING_INIT(compile_date, "compile_date");
+static HYPFS_STRING_INIT(compile_domain, "compile_domain");
+static HYPFS_STRING_INIT(extra, "extra");
+
+#ifdef CONFIG_HYPFS_CONFIG
+static HYPFS_STRING_INIT(config, "config");
+#endif
+
+static int __init buildinfo_init(void)
+{
+    hypfs_add_dir(&hypfs_root, &buildinfo, true);
+
+    hypfs_string_set_reference(&changeset, xen_changeset());
+    hypfs_add_leaf(&buildinfo, &changeset, true);
+
+    hypfs_add_dir(&buildinfo, &compileinfo, true);
+    hypfs_string_set_reference(&compiler, xen_compiler());
+    hypfs_string_set_reference(&compile_by, xen_compile_by());
+    hypfs_string_set_reference(&compile_date, xen_compile_date());
+    hypfs_string_set_reference(&compile_domain, xen_compile_domain());
+    hypfs_add_leaf(&compileinfo, &compiler, true);
+    hypfs_add_leaf(&compileinfo, &compile_by, true);
+    hypfs_add_leaf(&compileinfo, &compile_date, true);
+    hypfs_add_leaf(&compileinfo, &compile_domain, true);
+
+    major_version = xen_major_version();
+    minor_version = xen_minor_version();
+    hypfs_add_dir(&buildinfo, &version, true);
+    hypfs_string_set_reference(&extra, xen_extra_version());
+    hypfs_add_leaf(&version, &extra, true);
+    hypfs_add_leaf(&version, &major, true);
+    hypfs_add_leaf(&version, &minor, true);
+
+#ifdef CONFIG_HYPFS_CONFIG
+    config.e.encoding = XEN_HYPFS_ENC_GZIP;
+    config.e.size = xen_config_data_size;
+    config.u.content = xen_config_data;
+    hypfs_add_leaf(&buildinfo, &config, true);
+#endif
+
+    return 0;
+}
+__initcall(buildinfo_init);
+
+static HYPFS_DIR_INIT(params, "params");
+
+static int __init param_init(void)
+{
+    struct param_hypfs *param;
+
+    hypfs_add_dir(&hypfs_root, &params, true);
+
+    for ( param = __paramhypfs_start; param < __paramhypfs_end; param++ )
+    {
+        if ( param->init_leaf )
+            param->init_leaf(param);
+        else if ( param->hypfs.e.type == XEN_HYPFS_TYPE_STRING )
+            param->hypfs.e.size = strlen(param->hypfs.u.content) + 1;
+        hypfs_add_leaf(&params, &param->hypfs, true);
+    }
+
+    return 0;
+}
+__initcall(param_init);
+#endif
 
 # define DO(fn) long do_##fn
 
@@ -565,13 +639,6 @@ DO(xen_version)(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
 
     return -ENOSYS;
 }
-
-#ifdef VM_ASSIST_VALID
-DO(vm_assist)(unsigned int cmd, unsigned int type)
-{
-    return vm_assist(current->domain, cmd, type, VM_ASSIST_VALID);
-}
-#endif
 
 /*
  * Local variables:

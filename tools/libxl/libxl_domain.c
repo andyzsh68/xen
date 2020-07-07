@@ -314,10 +314,12 @@ libxl_dominfo * libxl_list_domain(libxl_ctx *ctx, int *nb_domain_out)
 {
     libxl_dominfo *ptr = NULL;
     int i, ret;
-    xc_domaininfo_t info[1024];
+    xc_domaininfo_t *info;
     int size = 0;
     uint32_t domid = 0;
     GC_INIT(ctx);
+
+    GCNEW_ARRAY(info, 1024);
 
     while ((ret = xc_domain_getinfolist(ctx->xch, domid, 1024, info)) > 0) {
         ptr = libxl__realloc(NOGC, ptr, (size + ret) * sizeof(libxl_dominfo));
@@ -1260,9 +1262,19 @@ static void dm_destroy_cb(libxl__egc *egc,
     libxl__destroy_domid_state *dis = CONTAINER_OF(ddms, *dis, ddms);
     STATE_AO_GC(dis->ao);
     uint32_t domid = dis->domid;
+    uint32_t target_domid;
 
     if (rc < 0)
         LOGD(ERROR, domid, "libxl__destroy_device_model failed");
+
+    if (libxl_is_stubdom(CTX, domid, &target_domid) &&
+        libxl__stubdomain_is_linux_running(gc, target_domid)) {
+        char *path = GCSPRINTF("/local/domain/%d/image/qmp-proxy-pid", domid);
+
+        libxl__kill_xs_path(gc, path, "QMP Proxy");
+        /* qmp-proxy for stubdom registers target_domid's QMP sockets. */
+        libxl__qmp_cleanup(gc, target_domid);
+    }
 
     dis->drs.ao = ao;
     dis->drs.domid = domid;

@@ -43,11 +43,7 @@
 #define TRAP_virtualisation   20
 #define TRAP_nr               32
 
-#define TRAP_HAVE_EC                                                    \
-    ((1u << TRAP_double_fault) | (1u << TRAP_invalid_tss) |             \
-     (1u << TRAP_no_segment) | (1u << TRAP_stack_error) |               \
-     (1u << TRAP_gp_fault) | (1u << TRAP_page_fault) |                  \
-     (1u << TRAP_alignment_check))
+#define TRAP_HAVE_EC X86_EXC_HAVE_EC
 
 /* Set for entry via SYSCALL. Informs return code to use SYSRETQ not IRETQ. */
 /* NB. Same as VGCF_in_syscall. No bits in common with any other TRAP_ defn. */
@@ -72,6 +68,7 @@
 #define PFEC_reserved_bit   (_AC(1,U) << 3)
 #define PFEC_insn_fetch     (_AC(1,U) << 4)
 #define PFEC_prot_key       (_AC(1,U) << 5)
+#define PFEC_shstk          (_AC(1,U) << 6)
 #define PFEC_arch_mask      (_AC(0xffff,U)) /* Architectural PFEC values. */
 /* Internally used only flags. */
 #define PFEC_page_paged     (1U<<16)
@@ -99,7 +96,7 @@
  * Host IA32_CR_PAT value to cover all memory types.  This is not the default
  * MSR_PAT value, and is an ABI with PV guests.
  */
-#define XEN_MSR_PAT 0x050100070406ul
+#define XEN_MSR_PAT _AC(0x050100070406, ULL)
 
 #ifndef __ASSEMBLY__
 
@@ -165,6 +162,7 @@ extern const struct x86_cpu_id *x86_match_cpu(const struct x86_cpu_id table[]);
 extern void identify_cpu(struct cpuinfo_x86 *);
 extern void setup_clear_cpu_cap(unsigned int);
 extern void setup_force_cpu_cap(unsigned int);
+extern bool is_forced_cpu_cap(unsigned int);
 extern void print_cpu_info(unsigned int cpu);
 extern void init_intel_cacheinfo(struct cpuinfo_x86 *c);
 
@@ -172,6 +170,11 @@ extern void init_intel_cacheinfo(struct cpuinfo_x86 *c);
 #define cpu_to_socket(_cpu) (cpu_data[_cpu].phys_proc_id)
 
 unsigned int apicid_to_socket(unsigned int);
+
+static inline int cpu_nr_siblings(unsigned int cpu)
+{
+    return cpu_data[cpu].x86_num_siblings;
+}
 
 /*
  * Generic CPUID function
@@ -437,15 +440,16 @@ struct __packed tss64 {
     uint16_t :16, bitmap;
 };
 struct tss_page {
-    struct tss64 __aligned(PAGE_SIZE) tss;
+    uint64_t __aligned(PAGE_SIZE) ist_ssp[8];
+    struct tss64 tss;
 };
 DECLARE_PER_CPU(struct tss_page, tss_page);
 
 #define IST_NONE 0UL
-#define IST_DF   1UL
+#define IST_MCE  1UL
 #define IST_NMI  2UL
-#define IST_MCE  3UL
-#define IST_DB   4UL
+#define IST_DB   3UL
+#define IST_DF   4UL
 #define IST_MAX  4UL
 
 /* Set the Interrupt Stack Table used by a particular IDT entry. */
@@ -533,6 +537,7 @@ DECLARE_TRAP_HANDLER(coprocessor_error);
 DECLARE_TRAP_HANDLER(simd_coprocessor_error);
 DECLARE_TRAP_HANDLER_CONST(machine_check);
 DECLARE_TRAP_HANDLER(alignment_check);
+DECLARE_TRAP_HANDLER(entry_CP);
 
 DECLARE_TRAP_HANDLER(entry_int82);
 
@@ -545,17 +550,40 @@ static inline void enable_nmis(void)
 {
     unsigned long tmp;
 
-    asm volatile ( "mov %%rsp, %[tmp]     \n\t"
-                   "push %[ss]            \n\t"
-                   "push %[tmp]           \n\t"
-                   "pushf                 \n\t"
-                   "push %[cs]            \n\t"
-                   "lea 1f(%%rip), %[tmp] \n\t"
-                   "push %[tmp]           \n\t"
-                   "iretq; 1:             \n\t"
-                   : [tmp] "=&r" (tmp)
+    asm volatile ( "mov     %%rsp, %[rsp]        \n\t"
+                   "lea    .Ldone(%%rip), %[rip] \n\t"
+#ifdef CONFIG_XEN_SHSTK
+                   /* Check for CET-SS being active. */
+                   "mov    $1, %k[ssp]           \n\t"
+                   "rdsspq %[ssp]                \n\t"
+                   "cmp    $1, %k[ssp]           \n\t"
+                   "je     .Lshstk_done          \n\t"
+
+                   /* Push 3 words on the shadow stack */
+                   ".rept 3                      \n\t"
+                   "call 1f; nop; 1:             \n\t"
+                   ".endr                        \n\t"
+
+                   /* Fixup to be an IRET shadow stack frame */
+                   "wrssq  %q[cs], -1*8(%[ssp])  \n\t"
+                   "wrssq  %[rip], -2*8(%[ssp])  \n\t"
+                   "wrssq  %[ssp], -3*8(%[ssp])  \n\t"
+
+                   ".Lshstk_done:"
+#endif
+                   /* Write an IRET regular frame */
+                   "push   %[ss]                 \n\t"
+                   "push   %[rsp]                \n\t"
+                   "pushf                        \n\t"
+                   "push   %q[cs]                \n\t"
+                   "push   %[rip]                \n\t"
+                   "iretq                        \n\t"
+                   ".Ldone:                      \n\t"
+                   : [rip] "=&r" (tmp),
+                     [rsp] "=&r" (tmp),
+                     [ssp] "=&r" (tmp)
                    : [ss] "i" (__HYPERVISOR_DS),
-                     [cs] "i" (__HYPERVISOR_CS) );
+                     [cs] "r" (__HYPERVISOR_CS) );
 }
 
 void sysenter_entry(void);

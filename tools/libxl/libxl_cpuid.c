@@ -201,18 +201,23 @@ int libxl_cpuid_parse_config(libxl_cpuid_policy_list *cpuid, const char* str)
         {"pku",          0x00000007,  0, CPUID_REG_ECX,  3,  1},
         {"ospke",        0x00000007,  0, CPUID_REG_ECX,  4,  1},
         {"avx512-vbmi2", 0x00000007,  0, CPUID_REG_ECX,  6,  1},
+        {"cet-ss",       0x00000007,  0, CPUID_REG_ECX,  7,  1},
         {"gfni",         0x00000007,  0, CPUID_REG_ECX,  8,  1},
         {"vaes",         0x00000007,  0, CPUID_REG_ECX,  9,  1},
         {"vpclmulqdq",   0x00000007,  0, CPUID_REG_ECX, 10,  1},
         {"avx512-vnni",  0x00000007,  0, CPUID_REG_ECX, 11,  1},
         {"avx512-bitalg",0x00000007,  0, CPUID_REG_ECX, 12,  1},
         {"avx512-vpopcntdq",0x00000007,0,CPUID_REG_ECX, 14,  1},
+        {"tsxldtrk",     0x00000007,  0, CPUID_REG_ECX, 16,  1},
         {"rdpid",        0x00000007,  0, CPUID_REG_ECX, 22,  1},
         {"cldemote",     0x00000007,  0, CPUID_REG_ECX, 25,  1},
 
         {"avx512-4vnniw",0x00000007,  0, CPUID_REG_EDX,  2,  1},
         {"avx512-4fmaps",0x00000007,  0, CPUID_REG_EDX,  3,  1},
+        {"srbds-ctrl",   0x00000007,  0, CPUID_REG_EDX,  9,  1},
         {"md-clear",     0x00000007,  0, CPUID_REG_EDX, 10,  1},
+        {"serialize",    0x00000007,  0, CPUID_REG_EDX, 14,  1},
+        {"cet-ibt",      0x00000007,  0, CPUID_REG_EDX, 20,  1},
         {"ibrsb",        0x00000007,  0, CPUID_REG_EDX, 26,  1},
         {"stibp",        0x00000007,  0, CPUID_REG_EDX, 27,  1},
         {"l1d-flush",    0x00000007,  0, CPUID_REG_EDX, 28,  1},
@@ -283,7 +288,7 @@ int libxl_cpuid_parse_config(libxl_cpuid_policy_list *cpuid, const char* str)
     char *sep, *val, *endptr;
     int i;
     const struct cpuid_flags *flag;
-    struct libxl__cpuid_policy *entry;
+    struct xc_xend_cpuid *entry;
     unsigned long num;
     char flags[33], *resstr;
 
@@ -361,7 +366,7 @@ int libxl_cpuid_parse_config_xend(libxl_cpuid_policy_list *cpuid,
     char *endptr;
     unsigned long value;
     uint32_t leaf, subleaf = XEN_CPUID_INPUT_UNUSED;
-    struct libxl__cpuid_policy *entry;
+    struct xc_xend_cpuid *entry;
 
     /* parse the leaf number */
     value = strtoul(str, &endptr, 0);
@@ -411,12 +416,9 @@ int libxl_cpuid_parse_config_xend(libxl_cpuid_policy_list *cpuid,
     return 0;
 }
 
-void libxl__cpuid_legacy(libxl_ctx *ctx, uint32_t domid,
+void libxl__cpuid_legacy(libxl_ctx *ctx, uint32_t domid, bool restore,
                          libxl_domain_build_info *info)
 {
-    libxl_cpuid_policy_list cpuid = info->cpuid;
-    int i;
-    char *cpuid_res[4];
     bool pae = true;
 
     /*
@@ -432,14 +434,7 @@ void libxl__cpuid_legacy(libxl_ctx *ctx, uint32_t domid,
     if (info->type == LIBXL_DOMAIN_TYPE_HVM)
         pae = libxl_defbool_val(info->u.hvm.pae);
 
-    xc_cpuid_apply_policy(ctx->xch, domid, NULL, 0, pae);
-
-    if (!cpuid)
-        return;
-
-    for (i = 0; cpuid[i].input[0] != XEN_CPUID_INPUT_UNUSED; i++)
-        xc_cpuid_set(ctx->xch, domid, cpuid[i].input,
-                     (const char**)(cpuid[i].policy), cpuid_res);
+    xc_cpuid_apply_policy(ctx->xch, domid, restore, NULL, 0, pae, info->cpuid);
 }
 
 static const char *input_names[2] = { "leaf", "subleaf" };

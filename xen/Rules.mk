@@ -1,3 +1,7 @@
+#
+# See docs/misc/xen-makefiles/makefiles.rst on variables that can be used in
+# Makefile and are consumed by Rules.mk
+#
 
 -include $(BASEDIR)/include/config/auto.conf
 
@@ -38,54 +42,11 @@ ALL_OBJS-y               += $(BASEDIR)/arch/$(TARGET_ARCH)/built_in.o
 ALL_OBJS-$(CONFIG_CRYPTO)   += $(BASEDIR)/crypto/built_in.o
 
 # Initialise some variables
-CFLAGS_UBSAN :=
-
-ifeq ($(CONFIG_DEBUG),y)
-CFLAGS += -O1
-else
-CFLAGS += -O2
-endif
-
-ifeq ($(CONFIG_FRAME_POINTER),y)
-CFLAGS += -fno-omit-frame-pointer
-else
-CFLAGS += -fomit-frame-pointer
-endif
-
-CFLAGS += -nostdinc -fno-builtin -fno-common
-CFLAGS += -Werror -Wredundant-decls -Wno-pointer-arith
-$(call cc-option-add,CFLAGS,CC,-Wvla)
-CFLAGS += -pipe -D__XEN__ -include $(BASEDIR)/include/xen/config.h
-CFLAGS-$(CONFIG_DEBUG_INFO) += -g
-CFLAGS += '-D__OBJECT_FILE__="$@"'
-
-ifneq ($(CONFIG_CC_IS_CLANG),y)
-# Clang doesn't understand this command line argument, and doesn't appear to
-# have an suitable alternative.  The resulting compiled binary does function,
-# but has an excessively large symbol table.
-CFLAGS += -Wa,--strip-local-absolute
-endif
-
-AFLAGS += -D__ASSEMBLY__
+targets :=
+CFLAGS-y :=
+AFLAGS-y :=
 
 ALL_OBJS := $(ALL_OBJS-y)
-
-# Get gcc to generate the dependencies for us.
-CFLAGS-y += -MMD -MP -MF $(@D)/.$(@F).d
-
-CFLAGS += $(CFLAGS-y)
-# allow extra CFLAGS externally via EXTRA_CFLAGS_XEN_CORE
-CFLAGS += $(EXTRA_CFLAGS_XEN_CORE)
-
-# Most CFLAGS are safe for assembly files:
-#  -std=gnu{89,99} gets confused by #-prefixed end-of-line comments
-#  -flto makes no sense and annoys clang
-AFLAGS += $(filter-out -std=gnu% -flto,$(CFLAGS))
-
-# LDFLAGS are only passed directly to $(LD)
-LDFLAGS += $(LDFLAGS_DIRECT)
-
-LDFLAGS += $(LDFLAGS-y)
 
 SPECIAL_DATA_SECTIONS := rodata $(foreach a,1 2 4 8 16, \
                                             $(foreach w,1 2 4, \
@@ -93,9 +54,19 @@ SPECIAL_DATA_SECTIONS := rodata $(foreach a,1 2 4 8 16, \
                                             rodata.cst$(a)) \
                          $(foreach r,rel rel.ro,data.$(r).local)
 
-include $(BASEDIR)/arch/$(TARGET_ARCH)/Rules.mk
-
 include Makefile
+
+# Linking
+# ---------------------------------------------------------------------------
+
+quiet_cmd_ld = LD      $@
+cmd_ld = $(LD) $(XEN_LDFLAGS) -r -o $@ $(real-prereqs)
+
+# Objcopy
+# ---------------------------------------------------------------------------
+
+quiet_cmd_objcopy = OBJCOPY $@
+cmd_objcopy = $(OBJCOPY) $(OBJCOPYFLAGS) $< $@
 
 define gendep
     ifneq ($(1),$(subst /,:,$(1)))
@@ -111,7 +82,11 @@ $(foreach o,$(filter-out %/,$(obj-y) $(obj-bin-y) $(extra-y)),$(eval $(call gend
 subdir-y := $(subdir-y) $(filter %/, $(obj-y))
 obj-y    := $(patsubst %/, %/built_in.o, $(obj-y))
 
-$(filter %.init.o,$(obj-y) $(obj-bin-y) $(extra-y)): CFLAGS += -DINIT_SECTIONS_ONLY
+# $(subdir-obj-y) is the list of objects in $(obj-y) which uses dir/ to
+# tell kbuild to descend
+subdir-obj-y := $(filter %/built_in.o, $(obj-y))
+
+$(filter %.init.o,$(obj-y) $(obj-bin-y) $(extra-y)): CFLAGS-y += -DINIT_SECTIONS_ONLY
 
 ifeq ($(CONFIG_COVERAGE),y)
 ifeq ($(CONFIG_CC_IS_CLANG),y)
@@ -119,19 +94,16 @@ ifeq ($(CONFIG_CC_IS_CLANG),y)
 else
     COV_FLAGS := -fprofile-arcs -ftest-coverage
 endif
-$(filter-out %.init.o $(nocov-y),$(obj-y) $(obj-bin-y) $(extra-y)): CFLAGS += $(COV_FLAGS)
+$(filter-out %.init.o $(nocov-y),$(obj-y) $(obj-bin-y) $(extra-y)): CFLAGS-y += $(COV_FLAGS)
 endif
 
 ifeq ($(CONFIG_UBSAN),y)
-CFLAGS_UBSAN += -fsanitize=undefined
 # Any -fno-sanitize= options need to come after any -fsanitize= options
 $(filter-out %.init.o $(noubsan-y),$(obj-y) $(obj-bin-y) $(extra-y)): \
-CFLAGS += $(filter-out -fno-%,$(CFLAGS_UBSAN)) $(filter -fno-%,$(CFLAGS_UBSAN))
+CFLAGS-y += $(filter-out -fno-%,$(CFLAGS_UBSAN)) $(filter -fno-%,$(CFLAGS_UBSAN))
 endif
 
 ifeq ($(CONFIG_LTO),y)
-CFLAGS += -flto
-LDFLAGS-$(CONFIG_CC_IS_CLANG) += -plugin LLVMgold.so
 # Would like to handle all object files as bitcode, but objects made from
 # pure asm are in a different format and have to be collected separately.
 # Mirror the directory tree, collecting them as built_in_bin.o.
@@ -144,28 +116,43 @@ obj-bin-y :=
 endif
 
 # Always build obj-bin files as binary even if they come from C source. 
-$(obj-bin-y): CFLAGS := $(filter-out -flto,$(CFLAGS))
+$(obj-bin-y): XEN_CFLAGS := $(filter-out -flto,$(XEN_CFLAGS))
+
+# Calculation of flags, first the generic flags, then the arch specific flags,
+# and last the flags modified for a target or a directory.
+
+c_flags = -MMD -MP -MF $(@D)/.$(@F).d $(XEN_CFLAGS) '-D__OBJECT_FILE__="$@"'
+a_flags = -MMD -MP -MF $(@D)/.$(@F).d $(XEN_AFLAGS)
+
+include $(BASEDIR)/arch/$(TARGET_ARCH)/Rules.mk
+
+c_flags += $(CFLAGS-y)
+a_flags += $(CFLAGS-y) $(AFLAGS-y)
 
 built_in.o: $(obj-y) $(extra-y)
 ifeq ($(obj-y),)
-	$(CC) $(CFLAGS) -c -x c /dev/null -o $@
+	$(CC) $(c_flags) -c -x c /dev/null -o $@
 else
 ifeq ($(CONFIG_LTO),y)
 	$(LD_LTO) -r -o $@ $(filter-out $(extra-y),$^)
 else
-	$(LD) $(LDFLAGS) -r -o $@ $(filter-out $(extra-y),$^)
+	$(LD) $(XEN_LDFLAGS) -r -o $@ $(filter-out $(extra-y),$^)
 endif
 endif
+
+targets += built_in.o
+targets += $(filter-out $(subdir-obj-y), $(obj-y)) $(extra-y)
+targets += $(MAKECMDGOALS)
 
 built_in_bin.o: $(obj-bin-y) $(extra-y)
 ifeq ($(obj-bin-y),)
-	$(CC) $(AFLAGS) -c -x assembler /dev/null -o $@
+	$(CC) $(a_flags) -c -x assembler /dev/null -o $@
 else
-	$(LD) $(LDFLAGS) -r -o $@ $(filter-out $(extra-y),$^)
+	$(LD) $(XEN_LDFLAGS) -r -o $@ $(filter-out $(extra-y),$^)
 endif
 
 # Force execution of pattern rules (for which PHONY cannot be directly used).
-.PHONY: FORCE
+PHONY += FORCE
 FORCE:
 
 %/built_in.o: FORCE
@@ -178,7 +165,7 @@ SRCPATH := $(patsubst $(BASEDIR)/%,%,$(CURDIR))
 
 %.o: %.c Makefile
 ifeq ($(CONFIG_ENFORCE_UNIQUE_SYMBOLS),y)
-	$(CC) $(CFLAGS) -c $< -o $(@D)/.$(@F).tmp -MQ $@
+	$(CC) $(c_flags) -c $< -o $(@D)/.$(@F).tmp -MQ $@
 ifeq ($(CONFIG_CC_IS_CLANG),y)
 	$(OBJCOPY) --redefine-sym $<=$(SRCPATH)/$< $(@D)/.$(@F).tmp $@
 else
@@ -186,31 +173,71 @@ else
 endif
 	rm -f $(@D)/.$(@F).tmp
 else
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(c_flags) -c $< -o $@
 endif
 
-%.o: %.S Makefile
-	$(CC) $(AFLAGS) -c $< -o $@
+quiet_cmd_cc_o_S = CC      $@
+cmd_cc_o_S = $(CC) $(a_flags) -c $< -o $@
 
-$(filter %.init.o,$(obj-y) $(obj-bin-y) $(extra-y)): %.init.o: %.o Makefile
-	$(OBJDUMP) -h $< | sed -n '/[0-9]/{s,00*,0,g;p;}' | while read idx name sz rest; do \
-		case "$$name" in \
-		.*.local) ;; \
-		.text|.text.*|.data|.data.*|.bss) \
-			test $$sz != 0 || continue; \
-			echo "Error: size of $<:$$name is 0x$$sz" >&2; \
-			exit $$(expr $$idx + 1);; \
-		esac; \
-	done
-	$(OBJCOPY) $(foreach s,$(SPECIAL_DATA_SECTIONS),--rename-section .$(s)=.init.$(s)) $< $@
+%.o: %.S FORCE
+	$(call if_changed,cc_o_S)
 
-%.i: %.c Makefile
-	$(CPP) $(filter-out -Wa$(comma)%,$(CFLAGS)) $< -o $@
 
-%.s: %.c Makefile
-	$(CC) $(filter-out -Wa$(comma)%,$(CFLAGS)) -S $< -o $@
+quiet_cmd_obj_init_o = INIT_O  $@
+define cmd_obj_init_o
+    $(OBJDUMP) -h $< | sed -n '/[0-9]/{s,00*,0,g;p;}' | while read idx name sz rest; do \
+        case "$$name" in \
+        .*.local) ;; \
+        .text|.text.*|.data|.data.*|.bss) \
+            test $$sz != 0 || continue; \
+            echo "Error: size of $<:$$name is 0x$$sz" >&2; \
+            exit $$(expr $$idx + 1);; \
+        esac; \
+    done; \
+    $(OBJCOPY) $(foreach s,$(SPECIAL_DATA_SECTIONS),--rename-section .$(s)=.init.$(s)) $< $@
+endef
 
-%.s: %.S Makefile
-	$(CPP) $(filter-out -Wa$(comma)%,$(AFLAGS)) $< -o $@
+$(filter %.init.o,$(obj-y) $(obj-bin-y) $(extra-y)): %.init.o: %.o FORCE
+	$(call if_changed,obj_init_o)
+
+quiet_cmd_cpp_i_c = CPP     $@
+cmd_cpp_i_c = $(CPP) $(filter-out -Wa$(comma)%,$(c_flags)) -MQ $@ -o $@ $<
+
+quiet_cmd_cc_s_c = CC      $@
+cmd_cc_s_c = $(CC) $(filter-out -Wa$(comma)%,$(c_flags)) -S $< -o $@
+
+quiet_cmd_s_S = CPP     $@
+cmd_s_S = $(CPP) $(filter-out -Wa$(comma)%,$(a_flags)) -MQ $@ -o $@ $<
+
+%.i: %.c FORCE
+	$(call if_changed,cpp_i_c)
+
+%.s: %.c FORCE
+	$(call if_changed,cc_s_c)
+
+%.s: %.S FORCE
+	$(call if_changed,cpp_s_S)
+
+# Add intermediate targets:
+# When building objects with specific suffix patterns, add intermediate
+# targets that the final targets are derived from.
+intermediate_targets = $(foreach sfx, $(2), \
+				$(patsubst %$(strip $(1)),%$(sfx), \
+					$(filter %$(strip $(1)), $(targets))))
+# %.init.o <- %.o
+targets += $(call intermediate_targets, .init.o, .o)
 
 -include $(DEPS_INCLUDE)
+
+# Read all saved command lines and dependencies for the $(targets) we
+# may be building above, using $(if_changed{,_dep}). As an
+# optimization, we don't need to read them if the target does not
+# exist, we will rebuild anyway in that case.
+
+existing-targets := $(wildcard $(sort $(targets)))
+
+-include $(foreach f,$(existing-targets),$(dir $(f)).$(notdir $(f)).cmd)
+
+# Declare the contents of the PHONY variable as phony.  We keep that
+# information in a variable so we can use it in if_changed and friends.
+.PHONY: $(PHONY)

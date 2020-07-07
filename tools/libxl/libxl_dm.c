@@ -734,14 +734,15 @@ static int libxl__build_device_model_args_old(libxl__gc *gc,
         if (libxl_defbool_val(vnc->findunused)) {
             flexarray_append(dm_args, "-vncunused");
         }
-    } else
+    } else if (!sdl) {
         /*
          * VNC is not enabled by default by qemu-xen-traditional,
-         * however passing -vnc none causes SDL to not be
-         * (unexpectedly) enabled by default. This is overridden by
-         * explicitly passing -sdl below as required.
+         * however skipping -vnc causes SDL to be
+         * (unexpectedly) enabled by default. If undesired, disable graphics at
+         * all.
          */
-        flexarray_append_pair(dm_args, "-vnc", "none");
+        flexarray_append(dm_args, "-nographic");
+    }
 
     if (sdl) {
         flexarray_append(dm_args, "-sdl");
@@ -1187,6 +1188,7 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
     int i, connection, devid;
     uint64_t ram_size;
     const char *path, *chardev;
+    bool is_stubdom = libxl_defbool_val(b_info->device_model_stubdomain);
 
     dm_args = flexarray_make(gc, 16, 1);
     dm_envs = flexarray_make(gc, 16, 1);
@@ -1196,39 +1198,46 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
     flexarray_vappend(dm_args, dm,
                       "-xen-domid",
                       GCSPRINTF("%d", guest_domid), NULL);
-
-    flexarray_append(dm_args, "-chardev");
-    if (state->dm_monitor_fd >= 0) {
-        flexarray_append(dm_args,
-            GCSPRINTF("socket,id=libxl-cmd,fd=%d,server,nowait",
-                      state->dm_monitor_fd));
-
-        /*
-         * Start QEMU with its "CPU" paused, it will not start any emulation
-         * until the QMP command "cont" is used. This also prevent QEMU from
-         * writing "running" to the "state" xenstore node so we only use this
-         * flag when we have the QMP based startup notification.
-         * */
-        flexarray_append(dm_args, "-S");
-    } else {
-        flexarray_append(dm_args,
-                         GCSPRINTF("socket,id=libxl-cmd,"
-                                   "path=%s,server,nowait",
-                                   libxl__qemu_qmp_path(gc, guest_domid)));
-    }
-
     flexarray_append(dm_args, "-no-shutdown");
-    flexarray_append(dm_args, "-mon");
-    flexarray_append(dm_args, "chardev=libxl-cmd,mode=control");
 
-    flexarray_append(dm_args, "-chardev");
-    flexarray_append(dm_args,
-                     GCSPRINTF("socket,id=libxenstat-cmd,"
-                                    "path=%s/qmp-libxenstat-%d,server,nowait",
-                                    libxl__run_dir_path(), guest_domid));
+    /*
+     * QMP access to qemu running in stubdomain is done over vchan. The
+     * stubdomain init script adds the appropriate monitor options for
+     * vchan-socket-proxy.
+     */
+    if (!is_stubdom) {
+        flexarray_append(dm_args, "-chardev");
+        if (state->dm_monitor_fd >= 0) {
+            flexarray_append(dm_args,
+                GCSPRINTF("socket,id=libxl-cmd,fd=%d,server,nowait",
+                          state->dm_monitor_fd));
 
-    flexarray_append(dm_args, "-mon");
-    flexarray_append(dm_args, "chardev=libxenstat-cmd,mode=control");
+            /*
+             * Start QEMU with its "CPU" paused, it will not start any emulation
+             * until the QMP command "cont" is used. This also prevent QEMU from
+             * writing "running" to the "state" xenstore node so we only use this
+             * flag when we have the QMP based startup notification.
+             * */
+            flexarray_append(dm_args, "-S");
+        } else {
+            flexarray_append(dm_args,
+                             GCSPRINTF("socket,id=libxl-cmd,"
+                                       "path=%s,server,nowait",
+                                       libxl__qemu_qmp_path(gc, guest_domid)));
+        }
+
+        flexarray_append(dm_args, "-mon");
+        flexarray_append(dm_args, "chardev=libxl-cmd,mode=control");
+
+        flexarray_append(dm_args, "-chardev");
+        flexarray_append(dm_args,
+                         GCSPRINTF("socket,id=libxenstat-cmd,"
+                                        "path=%s/qmp-libxenstat-%d,server,nowait",
+                                        libxl__run_dir_path(), guest_domid));
+
+        flexarray_append(dm_args, "-mon");
+        flexarray_append(dm_args, "chardev=libxenstat-cmd,mode=control");
+    }
 
     for (i = 0; i < guest_config->num_channels; i++) {
         connection = guest_config->channels[i].connection;
@@ -1272,7 +1281,7 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
         flexarray_vappend(dm_args, "-name", c_info->name, NULL);
     }
 
-    if (vnc) {
+    if (vnc && !is_stubdom) {
         char *vncarg = NULL;
 
         flexarray_append(dm_args, "-vnc");
@@ -1311,11 +1320,12 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
         }
 
         flexarray_append(dm_args, vncarg);
-    } else
+    } else if (!is_stubdom) {
         /*
          * Ensure that by default no vnc server is created.
          */
         flexarray_append_pair(dm_args, "-vnc", "none");
+    }
 
     /*
      * Ensure that by default no display backend is created. Further
@@ -1323,7 +1333,7 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
      */
     flexarray_append_pair(dm_args, "-display", "none");
 
-    if (sdl) {
+    if (sdl && !is_stubdom) {
         flexarray_append(dm_args, "-sdl");
         if (sdl->display)
             flexarray_append_pair(dm_envs, "DISPLAY", sdl->display);
@@ -1365,18 +1375,34 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
             {
                 LOGD(ERROR, guest_domid, "Both serial and serial_list set");
                 return ERROR_INVAL;
-            }
-            if (b_info->u.hvm.serial) {
-                flexarray_vappend(dm_args,
-                                  "-serial", b_info->u.hvm.serial, NULL);
-            } else if (b_info->u.hvm.serial_list) {
-                char **p;
-                for (p = b_info->u.hvm.serial_list;
-                     *p;
-                     p++) {
-                    flexarray_vappend(dm_args,
-                                      "-serial",
-                                      *p, NULL);
+            } else {
+                if (b_info->u.hvm.serial) {
+                    if (is_stubdom) {
+                        /* see spawn_stub_launch_dm() for connecting STUBDOM_CONSOLE_SERIAL */
+                        flexarray_vappend(dm_args,
+                                          "-serial",
+                                          GCSPRINTF("/dev/hvc%d", STUBDOM_CONSOLE_SERIAL),
+                                          NULL);
+                    } else {
+                        flexarray_vappend(dm_args,
+                                          "-serial", b_info->u.hvm.serial, NULL);
+                    }
+                } else if (b_info->u.hvm.serial_list) {
+                    char **p;
+                    /* see spawn_stub_launch_dm() for connecting STUBDOM_CONSOLE_SERIAL */
+                    for (p = b_info->u.hvm.serial_list, i = 0;
+                         *p;
+                         p++, i++) {
+                        if (is_stubdom)
+                            flexarray_vappend(dm_args,
+                                              "-serial",
+                                              GCSPRINTF("/dev/hvc%d", STUBDOM_CONSOLE_SERIAL + i),
+                                              NULL);
+                        else
+                            flexarray_vappend(dm_args,
+                                              "-serial",
+                                              *p, NULL);
+                    }
                 }
             }
         }
@@ -1385,7 +1411,7 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
             flexarray_append(dm_args, "-nographic");
         }
 
-        if (libxl_defbool_val(b_info->u.hvm.spice.enable)) {
+        if (libxl_defbool_val(b_info->u.hvm.spice.enable) && !is_stubdom) {
             const libxl_spice_info *spice = &b_info->u.hvm.spice;
             char *spiceoptions = dm_spice_options(gc, spice);
             if (!spiceoptions)
@@ -1723,10 +1749,19 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
     }
 
     if (state->saved_state) {
-        /* This file descriptor is meant to be used by QEMU */
-        *dm_state_fd = open(state->saved_state, O_RDONLY);
-        flexarray_append(dm_args, "-incoming");
-        flexarray_append(dm_args, GCSPRINTF("fd:%d",*dm_state_fd));
+        if (is_stubdom) {
+            /* Linux stubdomain must replace $STUBDOM_RESTORE_INCOMING_ARG
+             * with the approriate fd:$num argument for the
+             * STUBDOM_CONSOLE_RESTORE console 2.
+             */
+            flexarray_append(dm_args, "-incoming");
+            flexarray_append(dm_args, "$STUBDOM_RESTORE_INCOMING_ARG");
+        } else {
+            /* This file descriptor is meant to be used by QEMU */
+            *dm_state_fd = open(state->saved_state, O_RDONLY);
+            flexarray_append(dm_args, "-incoming");
+            flexarray_append(dm_args, GCSPRINTF("fd:%d",*dm_state_fd));
+        }
     }
     for (i = 0; b_info->extra && b_info->extra[i] != NULL; i++)
         flexarray_append(dm_args, b_info->extra[i]);
@@ -1812,7 +1847,9 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
              * If qemu isn't doing the interpreting, the parameter is
              * always raw
              */
-            if (disks[i].backend == LIBXL_DISK_BACKEND_QDISK)
+            if (libxl_defbool_val(b_info->device_model_stubdomain))
+                format = "host_device";
+            else if (disks[i].backend == LIBXL_DISK_BACKEND_QDISK)
                 format = libxl__qemu_disk_format_string(disks[i].format);
             else
                 format = libxl__qemu_disk_format_string(LIBXL_DISK_FORMAT_RAW);
@@ -1823,6 +1860,16 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
                          disks[i].vdev);
                     continue;
                 }
+            } else if (libxl_defbool_val(b_info->device_model_stubdomain)) {
+                if (disk > 'z' - 'a') {
+                    LOGD(WARN, guest_domid,
+                            "Emulation of only first %d disks is supported with qemu-xen in stubdomain.\n"
+                            "Disk %d will be available via PV drivers but not as an emulated disk.",
+                            'z' - 'a',
+                            disk);
+                    continue;
+                }
+                target_path = GCSPRINTF("/dev/xvd%c", 'a' + disk);
             } else {
                 if (format == NULL) {
                     LOGD(WARN, guest_domid,
@@ -1847,6 +1894,13 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
             }
 
             if (disks[i].is_cdrom) {
+                if (disk > 4) {
+                    LOGD(WARN, guest_domid, "Emulated CDROM can be only one of the first 4 disks.\n"
+                         "Disk %s will be available via PV drivers but not as an "
+                         "emulated disk.",
+                         disks[i].vdev);
+                    continue;
+                }
                 drive = libxl__sprintf(gc,
                          "if=ide,index=%d,readonly=on,media=cdrom,id=ide-%i",
                          disk, dev_number);
@@ -1924,6 +1978,10 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
                                                        &disks[i],
                                                        colo_mode);
                 } else {
+                    LOGD(WARN, guest_domid, "Only 4 emulated IDE disks are supported.\n"
+                         "Disk %s will be available via PV drivers but not as an "
+                         "emulated disk.",
+                         disks[i].vdev);
                     continue; /* Do not emulate this disk */
                 }
 
@@ -1963,7 +2021,7 @@ static int libxl__build_device_model_args(libxl__gc *gc,
                                         char ***args, char ***envs,
                                         const libxl__domain_build_state *state,
                                         int *dm_state_fd)
-/* dm_state_fd may be NULL iff caller knows we are using old stubdom
+/* dm_state_fd may be NULL iff caller knows we are using stubdom
  * and therefore will be passing a filename rather than a fd. */
 {
     switch (guest_config->b_info.device_model_version) {
@@ -1973,8 +2031,10 @@ static int libxl__build_device_model_args(libxl__gc *gc,
                                                   args, envs,
                                                   state);
     case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN:
-        assert(dm_state_fd != NULL);
-        assert(*dm_state_fd < 0);
+        if (!libxl_defbool_val(guest_config->b_info.device_model_stubdomain)) {
+            assert(dm_state_fd != NULL);
+            assert(*dm_state_fd < 0);
+        }
         return libxl__build_device_model_args_new(gc, dm,
                                                   guest_domid, guest_config,
                                                   args, envs,
@@ -2032,51 +2092,103 @@ static int libxl__vfb_and_vkb_from_hvm_guest_config(libxl__gc *gc,
 
 static int libxl__write_stub_dmargs(libxl__gc *gc,
                                     int dm_domid, int guest_domid,
-                                    char **args)
+                                    char **args, bool is_linux_stubdom)
 {
-    libxl_ctx *ctx = libxl__gc_owner(gc);
-    int i;
-    char *vm_path;
-    char *dmargs, *path;
-    int dmargs_size;
     struct xs_permissions roperm[2];
-    xs_transaction_t t;
+    xs_transaction_t t = XBT_NULL;
+    char *dmargs;
+    int rc;
 
     roperm[0].id = 0;
     roperm[0].perms = XS_PERM_NONE;
     roperm[1].id = dm_domid;
     roperm[1].perms = XS_PERM_READ;
 
-    vm_path = libxl__xs_read(gc, XBT_NULL, GCSPRINTF("/local/domain/%d/vm", guest_domid));
+    if (!is_linux_stubdom) {
+        int dmargs_size = 0;
+        int i = 0;
 
-    i = 0;
-    dmargs_size = 0;
-    while (args[i] != NULL) {
-        dmargs_size = dmargs_size + strlen(args[i]) + 1;
-        i++;
-    }
-    dmargs_size++;
-    dmargs = (char *) libxl__malloc(gc, dmargs_size);
-    i = 1;
-    dmargs[0] = '\0';
-    while (args[i] != NULL) {
-        if (strcmp(args[i], "-sdl") && strcmp(args[i], "-M") && strcmp(args[i], "xenfv")) {
-            strcat(dmargs, " ");
-            strcat(dmargs, args[i]);
+        while (args[i] != NULL) {
+            dmargs_size = dmargs_size + strlen(args[i]) + 1;
+            i++;
         }
-        i++;
-    }
-    path = GCSPRINTF("%s/image/dmargs", vm_path);
 
-retry_transaction:
-    t = xs_transaction_start(ctx->xsh);
-    xs_write(ctx->xsh, t, path, dmargs, strlen(dmargs));
-    xs_set_permissions(ctx->xsh, t, path, roperm, ARRAY_SIZE(roperm));
-    xs_set_permissions(ctx->xsh, t, GCSPRINTF("%s/rtc/timeoffset", vm_path), roperm, ARRAY_SIZE(roperm));
-    if (!xs_transaction_end(ctx->xsh, t, 0))
-        if (errno == EAGAIN)
-            goto retry_transaction;
+        dmargs_size++;
+        dmargs = (char *) libxl__malloc(gc, dmargs_size);
+
+        i = 1;
+        dmargs[0] = '\0';
+        while (args[i] != NULL) {
+            if (strcmp(args[i], "-sdl") && strcmp(args[i], "-M") && strcmp(args[i], "xenfv")) {
+                strcat(dmargs, " ");
+                strcat(dmargs, args[i]);
+            }
+            i++;
+        }
+    }
+
+    for (;;) {
+        const char *vm_path;
+        char *path;
+
+        rc = libxl__xs_transaction_start(gc, &t);
+        if (rc) goto out;
+
+        rc = libxl__xs_read_mandatory(gc, t,
+                                      GCSPRINTF("/local/domain/%d/vm",
+                                                guest_domid),
+                                      &vm_path);
+        if (rc) goto out;
+
+        if (is_linux_stubdom) {
+            int i;
+
+            path = GCSPRINTF("%s/image/dm-argv", vm_path);
+
+            rc = libxl__xs_mknod(gc, t, path, roperm, ARRAY_SIZE(roperm));
+            if (rc) goto out;
+
+            for (i=1; args[i] != NULL; i++) {
+                rc = libxl__xs_write_checked(gc, t,
+                                             GCSPRINTF("%s/%03d", path, i),
+                                             args[i]);
+                if (rc) goto out;
+            }
+        } else {
+            path = GCSPRINTF("%s/image/dmargs", vm_path);
+
+            rc = libxl__xs_mknod(gc, t, path, roperm, ARRAY_SIZE(roperm));
+            if (rc) goto out;
+
+            rc = libxl__xs_write_checked(gc, t, path, dmargs);
+            if (rc) goto out;
+
+            rc = libxl__xs_mknod(gc, t, GCSPRINTF("%s/rtc/timeoffset", vm_path),
+                                 roperm, ARRAY_SIZE(roperm));
+            if (rc) goto out;
+        }
+
+        rc = libxl__xs_transaction_commit(gc, &t);
+        if (!rc) break;
+        if (rc<0) goto out;
+    }
+
     return 0;
+
+ out:
+    libxl__xs_transaction_abort(gc, &t);
+
+    return rc;
+}
+
+static int libxl__store_libxl_entry(libxl__gc *gc, uint32_t domid,
+                                    const char *name, const char *value)
+{
+    char *path = NULL;
+
+    path = libxl__xs_libxl_path(gc, domid);
+    path = libxl__sprintf(gc, "%s/%s", path, name);
+    return libxl__xs_printf(gc, XBT_NULL, path, "%s", value);
 }
 
 static void dmss_init(libxl__dm_spawn_state *dmss)
@@ -2108,6 +2220,23 @@ static void stubdom_pvqemu_unpaused(libxl__egc *egc,
 static void stubdom_xswait_cb(libxl__egc *egc, libxl__xswait_state *xswait,
                               int rc, const char *p);
 
+static void spawn_qmp_proxy(libxl__egc *egc,
+                            libxl__stub_dm_spawn_state *sdss);
+
+static void qmp_proxy_confirm(libxl__egc *egc, libxl__spawn_state *spawn,
+                              const char *xsdata);
+
+static void qmp_proxy_startup_failed(libxl__egc *egc,
+                                     libxl__spawn_state *spawn,
+                                     int rc);
+
+static void qmp_proxy_detached(libxl__egc *egc,
+                               libxl__spawn_state *spawn);
+
+static void qmp_proxy_spawn_outcome(libxl__egc *egc,
+                                    libxl__stub_dm_spawn_state *sdss,
+                                    int rc);
+
 char *libxl__stub_dm_name(libxl__gc *gc, const char *guest_name)
 {
     return GCSPRINTF("%s-dm", guest_name);
@@ -2137,11 +2266,7 @@ void libxl__spawn_stub_dm(libxl__egc *egc, libxl__stub_dm_spawn_state *sdss)
     dmss_init(&sdss->pvqemu);
     libxl__xswait_init(&sdss->xswait);
 
-    if (guest_config->b_info.device_model_version !=
-        LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN_TRADITIONAL) {
-        ret = ERROR_INVAL;
-        goto out;
-    }
+    assert(libxl_defbool_val(guest_config->b_info.device_model_stubdomain));
 
     sdss->pvqemu.guest_domid = INVALID_DOMID;
 
@@ -2162,8 +2287,8 @@ void libxl__spawn_stub_dm(libxl__egc *egc, libxl__stub_dm_spawn_state *sdss)
 
     dm_config->b_info.shadow_memkb = 0;
     dm_config->b_info.max_vcpus = 1;
-    dm_config->b_info.max_memkb = 28 * 1024 +
-        guest_config->b_info.video_memkb;
+    dm_config->b_info.max_memkb = guest_config->b_info.stubdomain_memkb;
+    dm_config->b_info.max_memkb += guest_config->b_info.video_memkb;
     dm_config->b_info.target_memkb = dm_config->b_info.max_memkb;
 
     dm_config->b_info.max_grant_frames = guest_config->b_info.max_grant_frames;
@@ -2202,10 +2327,24 @@ void libxl__spawn_stub_dm(libxl__egc *egc, libxl__stub_dm_spawn_state *sdss)
         dm_config->num_vkbs = 1;
     }
 
-    stubdom_state->pv_kernel.path
-        = libxl__abs_path(gc, "ioemu-stubdom.gz", libxl__xenfirmwaredir_path());
-    stubdom_state->pv_cmdline = GCSPRINTF(" -d %d", guest_domid);
-    stubdom_state->pv_ramdisk.path = "";
+    if (guest_config->b_info.stubdomain_kernel &&
+        access(guest_config->b_info.stubdomain_kernel, R_OK) != 0) {
+        LOGED(ERROR, guest_domid, "could not access stubdomain kernel %s",
+              guest_config->b_info.stubdomain_kernel);
+        ret = ERROR_INVAL;
+        goto out;
+    }
+
+    if (guest_config->b_info.stubdomain_ramdisk &&
+        access(guest_config->b_info.stubdomain_ramdisk, R_OK) != 0) {
+        LOGED(ERROR, guest_domid, "could not access stubdomain ramdisk %s",
+              guest_config->b_info.stubdomain_ramdisk);
+        ret = ERROR_INVAL;
+        goto out;
+    }
+
+    stubdom_state->pv_kernel.path = guest_config->b_info.stubdomain_kernel;
+    stubdom_state->pv_ramdisk.path = guest_config->b_info.stubdomain_ramdisk;
 
     /* fixme: this function can leak the stubdom if it fails */
     ret = libxl__domain_make(gc, dm_config, stubdom_state,
@@ -2225,7 +2364,11 @@ void libxl__spawn_stub_dm(libxl__egc *egc, libxl__stub_dm_spawn_state *sdss)
         goto out;
     }
 
-    libxl__write_stub_dmargs(gc, dm_domid, guest_domid, args);
+    libxl__store_libxl_entry(gc, guest_domid, "dm-version",
+        libxl_device_model_version_to_string(dm_config->b_info.device_model_version));
+
+    libxl__write_stub_dmargs(gc, dm_domid, guest_domid, args,
+                             libxl__stubdomain_is_linux(&guest_config->b_info));
     libxl__xs_printf(gc, XBT_NULL,
                      GCSPRINTF("%s/image/device-model-domid",
                                libxl__xs_get_dompath(gc, guest_domid)),
@@ -2234,6 +2377,15 @@ void libxl__spawn_stub_dm(libxl__egc *egc, libxl__stub_dm_spawn_state *sdss)
                      GCSPRINTF("%s/target",
                                libxl__xs_get_dompath(gc, dm_domid)),
                      "%d", guest_domid);
+    if (guest_config->b_info.device_model_version == LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN) {
+        /* qemu-xen is used as a dm in the stubdomain, so we set the bios
+         * accroding to this */
+        libxl__xs_printf(gc, XBT_NULL,
+                        libxl__sprintf(gc, "%s/hvmloader/bios",
+                                       libxl__xs_get_dompath(gc, guest_domid)),
+                        "%s",
+                        libxl_bios_type_to_string(guest_config->b_info.u.hvm.bios));
+    }
     ret = xc_domain_set_target(ctx->xch, dm_domid, guest_domid);
     if (ret<0) {
         LOGED(ERROR, guest_domid, "setting target domain %d -> %d",
@@ -2313,8 +2465,13 @@ static void spawn_stub_launch_dm(libxl__egc *egc,
         if (ret) goto out;
     }
 
-    if (guest_config->b_info.u.hvm.serial)
+    if (guest_config->b_info.u.hvm.serial) {
         num_console++;
+    } else if (guest_config->b_info.u.hvm.serial_list) {
+        char **serial = guest_config->b_info.u.hvm.serial_list;
+        while (*(serial++))
+            num_console++;
+    }
 
     console = libxl__calloc(gc, num_console, sizeof(libxl__device_console));
 
@@ -2348,13 +2505,27 @@ static void spawn_stub_launch_dm(libxl__egc *egc,
                     console[i].output =
                         GCSPRINTF("pipe:%s", d_state->saved_state);
                 break;
+            case STUBDOM_CONSOLE_SERIAL:
+                if (guest_config->b_info.u.hvm.serial) {
+                    console[i].output = guest_config->b_info.u.hvm.serial;
+                    break;
+                }
+                /* fall-through */
             default:
-                console[i].output = "pty";
+                /* Serial_list is set, as otherwise num_consoles would be
+                 * smaller and consoles 0-2 are handled above. */
+                assert(guest_config->b_info.u.hvm.serial_list);
+                console[i].output = guest_config->b_info.u.hvm.serial_list[
+                    i-STUBDOM_CONSOLE_SERIAL];
                 break;
         }
     }
 
-    need_qemu = libxl__need_xenpv_qemu(gc, dm_config);
+    /*
+     * Until xenconsoled learns how to handle multiple consoles, require qemu
+     * in dom0 to serve consoles for a stubdomain - it require at least 3 of them.
+     */
+    need_qemu = 1 || libxl__need_xenpv_qemu(gc, &sdss->dm_config);
 
     for (i = 0; i < num_console; i++) {
         libxl__device device;
@@ -2367,24 +2538,154 @@ static void spawn_stub_launch_dm(libxl__egc *egc,
             goto out;
     }
 
-    sdss->pvqemu.spawn.ao = ao;
-    sdss->pvqemu.guest_domid = dm_domid;
-    sdss->pvqemu.guest_config = &sdss->dm_config;
-    sdss->pvqemu.build_state = &sdss->dm_state;
-    sdss->pvqemu.callback = spawn_stubdom_pvqemu_cb;
-
-    if (!need_qemu) {
-        /* If dom0 qemu not needed, do not launch it */
-        spawn_stubdom_pvqemu_cb(egc, &sdss->pvqemu, 0);
+    sdss->qmp_proxy_spawn.ao = ao;
+    if (libxl__stubdomain_is_linux(&guest_config->b_info)) {
+        spawn_qmp_proxy(egc, sdss);
     } else {
-        libxl__spawn_local_dm(egc, &sdss->pvqemu);
+        qmp_proxy_spawn_outcome(egc, sdss, 0);
     }
 
     return;
 
 out:
     assert(ret);
-    spawn_stubdom_pvqemu_cb(egc, &sdss->pvqemu, ret);
+    qmp_proxy_spawn_outcome(egc, sdss, ret);
+}
+
+static void spawn_qmp_proxy(libxl__egc *egc,
+                            libxl__stub_dm_spawn_state *sdss)
+{
+    STATE_AO_GC(sdss->qmp_proxy_spawn.ao);
+    const uint32_t guest_domid = sdss->dm.guest_domid;
+    const uint32_t dm_domid = sdss->pvqemu.guest_domid;
+    const char *dom_path = libxl__xs_get_dompath(gc, dm_domid);
+    char **args;
+    int nr = 0;
+    int rc, logfile_w, null;
+
+    if (access(STUBDOM_QMP_PROXY_PATH, X_OK) < 0) {
+        LOGED(ERROR, guest_domid, "qmp proxy %s is not executable", STUBDOM_QMP_PROXY_PATH);
+        rc = ERROR_FAIL;
+        goto out;
+    }
+
+    sdss->qmp_proxy_spawn.what = GCSPRINTF("domain %d device model qmp proxy", guest_domid);
+    sdss->qmp_proxy_spawn.pidpath = GCSPRINTF("%s/image/qmp-proxy-pid", dom_path);
+    sdss->qmp_proxy_spawn.xspath = DEVICE_MODEL_XS_PATH(gc, LIBXL_TOOLSTACK_DOMID,
+                                                        dm_domid, "/qmp-proxy-state");
+    sdss->qmp_proxy_spawn.timeout_ms = LIBXL_DEVICE_MODEL_START_TIMEOUT * 1000;
+    sdss->qmp_proxy_spawn.midproc_cb = libxl__spawn_record_pid;
+    sdss->qmp_proxy_spawn.confirm_cb = qmp_proxy_confirm;
+    sdss->qmp_proxy_spawn.failure_cb = qmp_proxy_startup_failed;
+    sdss->qmp_proxy_spawn.detached_cb = qmp_proxy_detached;
+
+    const int arraysize = 6;
+    GCNEW_ARRAY(args, arraysize);
+    args[nr++] = STUBDOM_QMP_PROXY_PATH;
+    args[nr++] = GCSPRINTF("--state-path=%s", sdss->qmp_proxy_spawn.xspath);
+    args[nr++] = GCSPRINTF("%u", dm_domid);
+    args[nr++] = GCSPRINTF("%s/device-model/%u/qmp-vchan", dom_path, guest_domid);
+    args[nr++] = (char*)libxl__qemu_qmp_path(gc, guest_domid);
+    args[nr++] = NULL;
+    assert(nr == arraysize);
+
+    logfile_w = libxl__create_qemu_logfile(gc, GCSPRINTF("qmp-proxy-%s",
+                                                         sdss->dm_config.c_info.name));
+    if (logfile_w < 0) {
+        rc = logfile_w;
+        goto out;
+    }
+    null = open("/dev/null", O_RDWR);
+    if (null < 0) {
+        LOGED(ERROR, guest_domid, "unable to open /dev/null");
+        rc = ERROR_FAIL;
+        goto out_close;
+    }
+
+    rc = libxl__spawn_spawn(egc, &sdss->qmp_proxy_spawn);
+    if (rc < 0)
+        goto out_close;
+    if (!rc) { /* inner child */
+        setsid();
+        libxl__exec(gc, null, null, logfile_w, STUBDOM_QMP_PROXY_PATH, args, NULL);
+        /* unreachable */
+    }
+
+    rc = 0;
+
+out_close:
+    if (logfile_w >= 0)
+        close(logfile_w);
+    if (null >= 0)
+        close(null);
+out:
+    if (rc)
+        qmp_proxy_spawn_outcome(egc, sdss, rc);
+}
+
+static void qmp_proxy_confirm(libxl__egc *egc, libxl__spawn_state *spawn,
+                              const char *xsdata)
+{
+    STATE_AO_GC(spawn->ao);
+
+    if (!xsdata)
+        return;
+
+    if (strcmp(xsdata, "running"))
+        return;
+
+    libxl__spawn_initiate_detach(gc, spawn);
+}
+
+static void qmp_proxy_startup_failed(libxl__egc *egc,
+                                     libxl__spawn_state *spawn,
+                                     int rc)
+{
+    libxl__stub_dm_spawn_state *sdss = CONTAINER_OF(spawn, *sdss, qmp_proxy_spawn);
+    qmp_proxy_spawn_outcome(egc, sdss, rc);
+}
+
+static void qmp_proxy_detached(libxl__egc *egc,
+                               libxl__spawn_state *spawn)
+{
+    libxl__stub_dm_spawn_state *sdss = CONTAINER_OF(spawn, *sdss, qmp_proxy_spawn);
+    qmp_proxy_spawn_outcome(egc, sdss, 0);
+}
+
+static void qmp_proxy_spawn_outcome(libxl__egc *egc,
+                                    libxl__stub_dm_spawn_state *sdss,
+                                    int rc)
+{
+    STATE_AO_GC(sdss->qmp_proxy_spawn.ao);
+    /*
+     * Until xenconsoled learns how to handle multiple consoles, require qemu
+     * in dom0 to serve consoles for a stubdomain - it require at least 3 of them.
+     */
+    int need_pvqemu = 1 || libxl__need_xenpv_qemu(gc, &sdss->dm_config);
+
+    if (rc) goto out;
+
+    if (need_pvqemu < 0) {
+        rc = need_pvqemu;
+        goto out;
+    }
+
+    sdss->pvqemu.spawn.ao = ao;
+    sdss->pvqemu.guest_config = &sdss->dm_config;
+    sdss->pvqemu.build_state = &sdss->dm_state;
+    sdss->pvqemu.callback = spawn_stubdom_pvqemu_cb;
+    if (need_pvqemu) {
+        libxl__spawn_local_dm(egc, &sdss->pvqemu);
+    } else {
+        /* If dom0 qemu not needed, do not launch it */
+        spawn_stubdom_pvqemu_cb(egc, &sdss->pvqemu, 0);
+    }
+
+    return;
+
+out:
+    assert(rc);
+    spawn_stubdom_pvqemu_cb(egc, &sdss->pvqemu, rc);
 }
 
 static void spawn_stubdom_pvqemu_cb(libxl__egc *egc,
@@ -3106,32 +3407,7 @@ out:
 /* Generic function to signal a Qemu instance to exit */
 static int kill_device_model(libxl__gc *gc, const char *xs_path_pid)
 {
-    const char *xs_pid;
-    int ret, pid;
-
-    ret = libxl__xs_read_checked(gc, XBT_NULL, xs_path_pid, &xs_pid);
-    if (ret || !xs_pid) {
-        LOG(ERROR, "unable to find device model pid in %s", xs_path_pid);
-        ret = ret ? : ERROR_FAIL;
-        goto out;
-    }
-    pid = atoi(xs_pid);
-
-    ret = kill(pid, SIGHUP);
-    if (ret < 0 && errno == ESRCH) {
-        LOG(ERROR, "Device Model already exited");
-        ret = 0;
-    } else if (ret == 0) {
-        LOG(DEBUG, "Device Model signaled");
-        ret = 0;
-    } else {
-        LOGE(ERROR, "failed to kill Device Model [%d]", pid);
-        ret = ERROR_FAIL;
-        goto out;
-    }
-
-out:
-    return ret;
+    return libxl__kill_xs_path(gc, xs_path_pid, "Device Model");
 }
 
 /* Helper to destroy a Qdisk backend */
@@ -3474,12 +3750,18 @@ out:
 
 int libxl__dm_active(libxl__gc *gc, uint32_t domid)
 {
-    char *pid, *path;
+    char *pid, *dm_domid, *path;
 
     path = GCSPRINTF("/local/domain/%d/image/device-model-pid", domid);
     pid = libxl__xs_read(gc, XBT_NULL, path);
 
-    return pid != NULL;
+    if (pid)
+        return true;
+
+    path = GCSPRINTF("/local/domain/%d/image/device-model-domid", domid);
+    dm_domid = libxl__xs_read(gc, XBT_NULL, path);
+
+    return dm_domid != NULL;
 }
 
 int libxl__dm_check_start(libxl__gc *gc, libxl_domain_config *d_config,

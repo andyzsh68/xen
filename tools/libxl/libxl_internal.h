@@ -56,6 +56,7 @@
 #define XC_WANT_COMPAT_MAP_FOREIGN_API
 #include <xenctrl.h>
 #include <xenguest.h>
+#include <xenhypfs.h>
 #include <xc_dom.h>
 
 #include <xen-tools/libs.h>
@@ -119,6 +120,7 @@
 #define STUBDOM_CONSOLE_RESTORE 2
 #define STUBDOM_CONSOLE_SERIAL 3
 #define STUBDOM_SPECIAL_CONSOLES 3
+#define LIBXL_LINUX_STUBDOM_MEM 128
 #define TAP_DEVICE_SUFFIX "-emu"
 #define DOMID_XS_PATH "domid"
 #define PVSHIM_BASENAME "xen-shim"
@@ -1397,6 +1399,10 @@ typedef struct {
 
     /* ARM only to deal with broken firmware */
     uint32_t clock_frequency;
+
+    /* Whether this domain is being migrated/restored, or booting fresh.  Only
+     * applicable to the primary domain, not support domains (e.g. stub QEMU). */
+    bool restore;
 } libxl__domain_build_state;
 
 _hidden void libxl__domain_build_state_init(libxl__domain_build_state *s);
@@ -2050,17 +2056,7 @@ typedef yajl_gen_status (*libxl__gen_json_callback)(yajl_gen hand, void *);
 _hidden char *libxl__object_to_json(libxl_ctx *ctx, const char *type,
                                     libxl__gen_json_callback gen, void *p);
 
-  /* holds the CPUID response for a single CPUID leaf
-   * input contains the value of the EAX and ECX register,
-   * and each policy string contains a filter to apply to
-   * the host given values for that particular leaf.
-   */
-struct libxl__cpuid_policy {
-    uint32_t input[2];
-    char *policy[4];
-};
-
-_hidden void libxl__cpuid_legacy(libxl_ctx *ctx, uint32_t domid,
+_hidden void libxl__cpuid_legacy(libxl_ctx *ctx, uint32_t domid, bool retore,
                                  libxl_domain_build_info *info);
 
 /* Calls poll() again - useful to check whether a signaled condition
@@ -2319,6 +2315,23 @@ _hidden char *libxl__json_object_to_json(libxl__gc *gc,
 _hidden int libxl__device_model_version_running(libxl__gc *gc, uint32_t domid);
   /* Return the system-wide default device model */
 _hidden libxl_device_model_version libxl__default_device_model(libxl__gc *gc);
+
+static inline
+bool libxl__stubdomain_is_linux_running(libxl__gc *gc, uint32_t domid)
+{
+    /* same logic as in libxl__stubdomain_is_linux */
+    return libxl__device_model_version_running(gc, domid)
+        == LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN;
+}
+
+static inline
+bool libxl__stubdomain_is_linux(libxl_domain_build_info *b_info)
+{
+    /* right now qemu-tranditional implies MiniOS stubdomain and qemu-xen
+     * implies Linux stubdomain */
+    return libxl_defbool_val(b_info->device_model_stubdomain) &&
+        b_info->device_model_version == LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN;
+}
 
 #define DEVICE_MODEL_XS_PATH(gc, dm_domid, domid, fmt, _a...)              \
     libxl__sprintf(gc, "/local/domain/%u/device-model/%u" fmt, dm_domid,   \
@@ -2689,6 +2702,9 @@ int libxl__async_exec_start(libxl__async_exec_state *aes);
 bool libxl__async_exec_inuse(const libxl__async_exec_state *aes);
 
 _hidden void libxl__kill(libxl__gc *gc, pid_t pid, int sig, const char *what);
+/* kill SIGHUP a pid stored in xenstore */
+_hidden int libxl__kill_xs_path(libxl__gc *gc, const char *xs_path_pid,
+                                const char *what);
 
 /*----- device addition/removal -----*/
 
@@ -4141,6 +4157,7 @@ typedef struct {
     libxl__destroy_domid_state dis;
     libxl__multidev multidev;
     libxl__xswait_state xswait;
+    libxl__spawn_state qmp_proxy_spawn;
 } libxl__stub_dm_spawn_state;
 
 _hidden void libxl__spawn_stub_dm(libxl__egc *egc, libxl__stub_dm_spawn_state*);

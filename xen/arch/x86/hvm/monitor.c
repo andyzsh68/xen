@@ -39,9 +39,6 @@ bool hvm_monitor_cr(unsigned int index, unsigned long value, unsigned long old)
     struct arch_domain *ad = &curr->domain->arch;
     unsigned int ctrlreg_bitmask = monitor_ctrlreg_bitmask(index);
 
-    if ( index == VM_EVENT_X86_CR3 && hvm_pcid_enabled(curr) )
-        value &= ~X86_CR3_NOFLUSH; /* Clear the noflush bit. */
-
     if ( (ad->monitor.write_ctrlreg_enabled & ctrlreg_bitmask) &&
          (!(ad->monitor.write_ctrlreg_onchangeonly & ctrlreg_bitmask) ||
           value != old) &&
@@ -56,11 +53,11 @@ bool hvm_monitor_cr(unsigned int index, unsigned long value, unsigned long old)
             .u.write_ctrlreg.old_value = old
         };
 
-        if ( monitor_traps(curr, sync, &req) >= 0 )
-            return 1;
+        return monitor_traps(curr, sync, &req) >= 0 &&
+               curr->domain->arch.monitor.control_register_values;
     }
 
-    return 0;
+    return false;
 }
 
 bool hvm_monitor_emul_unimplemented(void)
@@ -80,7 +77,7 @@ bool hvm_monitor_emul_unimplemented(void)
         monitor_traps(curr, true, &req) == 1;
 }
 
-void hvm_monitor_msr(unsigned int msr, uint64_t new_value, uint64_t old_value)
+bool hvm_monitor_msr(unsigned int msr, uint64_t new_value, uint64_t old_value)
 {
     struct vcpu *curr = current;
 
@@ -95,8 +92,11 @@ void hvm_monitor_msr(unsigned int msr, uint64_t new_value, uint64_t old_value)
             .u.mov_to_msr.old_value = old_value
         };
 
-        monitor_traps(curr, 1, &req);
+        return monitor_traps(curr, 1, &req) >= 0 &&
+               curr->domain->arch.monitor.control_register_values;
     }
+
+    return false;
 }
 
 void hvm_monitor_descriptor_access(uint64_t exit_info,

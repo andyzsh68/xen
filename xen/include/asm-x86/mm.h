@@ -287,7 +287,9 @@ struct page_info
          */
         struct {
             uint16_t shadow_flags;
+#ifdef CONFIG_HVM
             bool pagetable_dying;
+#endif
         };
 
         /* When in use as a shadow, next shadow in this hash chain. */
@@ -534,7 +536,6 @@ void memguard_unguard_range(void *p, unsigned long l);
 
 void memguard_guard_stack(void *p);
 void memguard_unguard_stack(void *p);
-bool __attribute_const__ memguard_is_stack_guard_page(unsigned long addr);
 
 struct mmio_ro_emulate_ctxt {
         unsigned long cr2;

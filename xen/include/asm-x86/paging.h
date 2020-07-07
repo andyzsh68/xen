@@ -92,7 +92,6 @@
  * These shouldn't be used directly by callers; rather use the functions
  * below which will indirect through this table as appropriate. */
 
-struct sh_emulate_ctxt;
 struct shadow_paging_mode {
 #ifdef CONFIG_SHADOW_PAGING
     void          (*detach_old_tables     )(struct vcpu *v);
@@ -103,6 +102,7 @@ struct shadow_paging_mode {
                                             intpte_t *old, intpte_t new,
                                             mfn_t gmfn);
 #endif
+#ifdef CONFIG_HVM
     mfn_t         (*make_monitor_table    )(struct vcpu *v);
     void          (*destroy_monitor_table )(struct vcpu *v, mfn_t mmfn);
     int           (*guess_wrmap           )(struct vcpu *v, 
@@ -110,6 +110,7 @@ struct shadow_paging_mode {
     void          (*pagetable_dying       )(paddr_t gpa);
     void          (*trace_emul_write_val  )(const void *ptr, unsigned long vaddr,
                                             const void *src, unsigned int bytes);
+#endif
 #endif
     /* For outsiders to tell what mode we're in */
     unsigned int shadow_levels;

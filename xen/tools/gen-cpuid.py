@@ -23,6 +23,7 @@ class State(object):
         self.raw = {
             '!': set(),
             'A': set(), 'S': set(), 'H': set(),
+            'a': set(), 's': set(), 'h': set(),
         }
 
         # State calculated
@@ -129,13 +130,13 @@ def crunch_numbers(state):
                  MTRR, PGE, MCA, CMOV, PAT, PSE36, MMX, FXSR)
     state.common_1d = common_1d
 
-    state.pv_def = state.raw['A']
-    state.hvm_shadow_def = state.pv_def | state.raw['S']
-    state.hvm_hap_def = state.hvm_shadow_def | state.raw['H']
+    state.pv_def =                                state.raw['A']
+    state.hvm_shadow_def = state.pv_def         | state.raw['S']
+    state.hvm_hap_def =    state.hvm_shadow_def | state.raw['H']
 
-    state.pv_max = state.pv_def
-    state.hvm_shadow_max = state.hvm_shadow_def
-    state.hvm_hap_max = state.hvm_hap_def
+    state.pv_max =                                state.raw['A'] | state.raw['a']
+    state.hvm_shadow_max = state.pv_max         | state.raw['S'] | state.raw['s']
+    state.hvm_hap_max =    state.hvm_shadow_max | state.raw['H'] | state.raw['h']
 
     #
     # Feature dependency information.
@@ -284,6 +285,9 @@ def crunch_numbers(state):
         # as dependent features simplifies Xen's logic, and prevents the guest
         # from seeing implausible configurations.
         IBRSB: [STIBP, SSBD],
+
+        # In principle the TSXLDTRK insns could also be considered independent.
+        RTM: [TSXLDTRK],
     }
 
     deep_features = tuple(sorted(deps.keys()))

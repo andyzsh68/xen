@@ -25,7 +25,9 @@
 #define BUG_ON(p)  do { if (unlikely(p)) BUG();  } while (0)
 #define WARN_ON(p) do { if (unlikely(p)) WARN(); } while (0)
 
-#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6)
+/* All clang versions supported by Xen have _Static_assert. */
+#if defined(__clang__) || \
+    (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6))
 /* Force a compilation error if condition is true */
 #define BUILD_BUG_ON(cond) ({ _Static_assert(!(cond), "!(" #cond ")"); })
 
@@ -75,7 +77,6 @@
 struct domain;
 
 void cmdline_parse(const char *cmdline);
-int runtime_parse(const char *line);
 int parse_bool(const char *s, const char *e);
 
 /**
@@ -122,8 +123,6 @@ extern void guest_printk(const struct domain *d, const char *format, ...)
     __attribute__ ((format (printf, 2, 3)));
 extern void noreturn panic(const char *format, ...)
     __attribute__ ((format (printf, 1, 2)));
-extern long vm_assist(struct domain *, unsigned int cmd, unsigned int type,
-                      unsigned long valid);
 extern int __printk_ratelimit(int ratelimit_ms, int ratelimit_burst);
 extern int printk_ratelimit(void);
 

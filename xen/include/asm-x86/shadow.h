@@ -22,7 +22,6 @@
 #ifndef _XEN_SHADOW_H
 #define _XEN_SHADOW_H
 
-#include <public/domctl.h>
 #include <xen/sched.h>
 #include <xen/perfc.h>
 #include <xen/domain_page.h>
@@ -30,6 +29,8 @@
 #include <asm/paging.h>
 #include <asm/p2m.h>
 #include <asm/spec_ctrl.h>
+
+#include <public/domctl.h>
 
 /*****************************************************************************
  * Macros to tell which shadow paging mode a domain is in*/
@@ -64,7 +65,7 @@ int shadow_enable(struct domain *d, u32 mode);
 int shadow_track_dirty_vram(struct domain *d,
                             unsigned long first_pfn,
                             unsigned long nr,
-                            XEN_GUEST_HANDLE_PARAM(void) dirty_bitmap);
+                            XEN_GUEST_HANDLE(void) dirty_bitmap);
 
 /* Handler for shadow control ops: operations from user-space to enable
  * and disable ephemeral shadow modes (test mode and log-dirty mode) and

@@ -84,7 +84,7 @@ static const opcode_desc_t opcode_table[256] = {
     ByteOp|DstReg|SrcMem|ModRM, DstReg|SrcMem|ModRM,
     ByteOp|DstEax|SrcImm, DstEax|SrcImm, 0, ImplicitOps,
     /* 0x38 - 0x3F */
-    ByteOp|DstMem|SrcReg|ModRM, DstMem|SrcReg|ModRM,
+    ByteOp|DstReg|SrcMem|ModRM, DstReg|SrcMem|ModRM,
     ByteOp|DstReg|SrcMem|ModRM, DstReg|SrcMem|ModRM,
     ByteOp|DstEax|SrcImm, DstEax|SrcImm, 0, ImplicitOps,
     /* 0x40 - 0x4F */
@@ -548,6 +548,8 @@ static const struct ext0f38_table {
     [0xf1] = { .to_mem = 1, .two_op = 1 },
     [0xf2 ... 0xf3] = {},
     [0xf5 ... 0xf7] = {},
+    [0xf8] = { .simd_size = simd_other },
+    [0xf9] = { .to_mem = 1, .two_op = 1 /* Mov */ },
 };
 
 /* Shift values between src and dst sizes of pmov{s,z}x{b,w,d}{w,d,q}. */
@@ -851,6 +853,20 @@ struct x86_emulate_state {
         rmw_xchg,
         rmw_xor,
     } rmw;
+    enum {
+        blk_NONE,
+        blk_enqcmd,
+#ifndef X86EMUL_NO_FPU
+        blk_fld, /* FLDENV, FRSTOR */
+        blk_fst, /* FNSTENV, FNSAVE */
+#endif
+#if !defined(X86EMUL_NO_FPU) || !defined(X86EMUL_NO_MMX) || \
+    !defined(X86EMUL_NO_SIMD)
+        blk_fxrstor,
+        blk_fxsave,
+#endif
+        blk_movdir,
+    } blk;
     uint8_t modrm, modrm_mod, modrm_reg, modrm_rm;
     uint8_t sib_index, sib_scale;
     uint8_t rex_prefix;
@@ -890,12 +906,80 @@ struct x86_emulate_state {
 #define PTR_POISON NULL /* 32-bit builds are for user-space, so NULL is OK. */
 #endif
 
+#ifndef X86EMUL_NO_FPU
+struct x87_env16 {
+    uint16_t fcw;
+    uint16_t fsw;
+    uint16_t ftw;
+    union {
+        struct {
+            uint16_t fip_lo;
+            uint16_t fop:11, :1, fip_hi:4;
+            uint16_t fdp_lo;
+            uint16_t :12, fdp_hi:4;
+        } real;
+        struct {
+            uint16_t fip;
+            uint16_t fcs;
+            uint16_t fdp;
+            uint16_t fds;
+        } prot;
+    } mode;
+};
+
+struct x87_env32 {
+    uint32_t fcw:16, :16;
+    uint32_t fsw:16, :16;
+    uint32_t ftw:16, :16;
+    union {
+        struct {
+            /* some CPUs/FPUs also store the full FIP here */
+            uint32_t fip_lo:16, :16;
+            uint32_t fop:11, :1, fip_hi:16, :4;
+            /* some CPUs/FPUs also store the full FDP here */
+            uint32_t fdp_lo:16, :16;
+            uint32_t :12, fdp_hi:16, :4;
+        } real;
+        struct {
+            uint32_t fip;
+            uint32_t fcs:16, fop:11, :5;
+            uint32_t fdp;
+            uint32_t fds:16, :16;
+        } prot;
+    } mode;
+};
+#endif
+
 typedef union {
     uint64_t mmx;
     uint64_t __attribute__ ((aligned(16))) xmm[2];
     uint64_t __attribute__ ((aligned(32))) ymm[4];
     uint64_t __attribute__ ((aligned(64))) zmm[8];
+    uint32_t data32[16];
 } mmval_t;
+
+struct x86_fxsr {
+    uint16_t fcw;
+    uint16_t fsw;
+    uint8_t ftw, :8;
+    uint16_t fop;
+    union {
+        struct {
+            uint32_t offs;
+            uint16_t sel, :16;
+        };
+        uint64_t addr;
+    } fip, fdp;
+    uint32_t mxcsr;
+    uint32_t mxcsr_mask;
+    struct {
+        uint8_t data[10];
+        uint16_t :16, :16, :16;
+    } fpreg[8];
+    uint64_t __attribute__ ((aligned(16))) xmm[16][2];
+    uint64_t rsvd[6];
+    uint64_t avl[6];
+};
 
 /*
  * While proper alignment gets specified above, this doesn't get honored by
@@ -1854,6 +1938,7 @@ amd_like(const struct x86_emulate_ctxt *ctxt)
 #define vcpu_has_cmov()        (ctxt->cpuid->basic.cmov)
 #define vcpu_has_clflush()     (ctxt->cpuid->basic.clflush)
 #define vcpu_has_mmx()         (ctxt->cpuid->basic.mmx)
+#define vcpu_has_fxsr()        (ctxt->cpuid->basic.fxsr)
 #define vcpu_has_sse()         (ctxt->cpuid->basic.sse)
 #define vcpu_has_sse2()        (ctxt->cpuid->basic.sse2)
 #define vcpu_has_sse3()        (ctxt->cpuid->basic.sse3)
@@ -1913,9 +1998,14 @@ amd_like(const struct x86_emulate_ctxt *ctxt)
 #define vcpu_has_avx512_vnni() (ctxt->cpuid->feat.avx512_vnni)
 #define vcpu_has_avx512_bitalg() (ctxt->cpuid->feat.avx512_bitalg)
 #define vcpu_has_avx512_vpopcntdq() (ctxt->cpuid->feat.avx512_vpopcntdq)
+#define vcpu_has_tsxldtrk()    (ctxt->cpuid->feat.tsxldtrk)
 #define vcpu_has_rdpid()       (ctxt->cpuid->feat.rdpid)
+#define vcpu_has_movdiri()     (ctxt->cpuid->feat.movdiri)
+#define vcpu_has_movdir64b()   (ctxt->cpuid->feat.movdir64b)
+#define vcpu_has_enqcmd()      (ctxt->cpuid->feat.enqcmd)
 #define vcpu_has_avx512_4vnniw() (ctxt->cpuid->feat.avx512_4vnniw)
 #define vcpu_has_avx512_4fmaps() (ctxt->cpuid->feat.avx512_4fmaps)
+#define vcpu_has_serialize()   (ctxt->cpuid->feat.serialize)
 #define vcpu_has_avx512_bf16() (ctxt->cpuid->feat.avx512_bf16)
 
 #define vcpu_must_have(feat) \
@@ -2479,7 +2569,6 @@ x86_decode_onebyte(
     case 0x60: /* pusha */
     case 0x61: /* popa */
     case 0x62: /* bound */
-    case 0x82: /* Grp1 (x86/32 only) */
     case 0xc4: /* les */
     case 0xc5: /* lds */
     case 0xce: /* into */
@@ -2487,6 +2576,14 @@ x86_decode_onebyte(
     case 0xd5: /* aad */
     case 0xd6: /* salc */
         state->not_64bit = true;
+        break;
+
+    case 0x82: /* Grp1 (x86/32 only) */
+        state->not_64bit = true;
+        /* fall through */
+    case 0x80: case 0x81: case 0x83: /* Grp1 */
+        if ( (modrm_reg & 7) == 7 ) /* cmp */
+            state->desc = (state->desc & ByteOp) | DstNone | SrcMem;
         break;
 
     case 0x90: /* nop / pause */
@@ -2517,6 +2614,11 @@ x86_decode_onebyte(
 
     case 0xc8: /* enter imm16,imm8 */
         imm2 = insn_fetch_type(uint8_t);
+        break;
+
+    case 0xf6: case 0xf7: /* Grp3 */
+        if ( !(modrm_reg & 6) ) /* test */
+            state->desc = (state->desc & ByteOp) | DstNone | SrcMem;
         break;
 
     case 0xff: /* Grp5 */
@@ -2722,10 +2824,12 @@ x86_decode_0f38(
     {
     case 0x00 ... 0xef:
     case 0xf2 ... 0xf5:
-    case 0xf7 ... 0xff:
+    case 0xf7 ... 0xf8:
+    case 0xfa ... 0xff:
         op_bytes = 0;
         /* fall through */
     case 0xf6: /* adcx / adox */
+    case 0xf9: /* movdiri */
         ctxt->opcode |= MASK_INSR(vex.pfx, X86EMUL_OPC_PFX_MASK);
         break;
 
@@ -3492,6 +3596,7 @@ x86_decode(
             op_bytes = 4;
         break;
 
+#ifndef X86EMUL_NO_SIMD
     case simd_packed_int:
         switch ( vex.pfx )
         {
@@ -3557,6 +3662,7 @@ x86_decode(
     case simd_256:
         op_bytes = 32;
         break;
+#endif /* !X86EMUL_NO_SIMD */
 
     default:
         op_bytes = 0;
@@ -3711,6 +3817,7 @@ x86_emulate(
         break;
     }
 
+#ifndef X86EMUL_NO_SIMD
     /* With a memory operand, fetch the mask register in use (if any). */
     if ( ea.type == OP_MEM && evex.opmsk &&
          _get_fpu(fpu_type = X86EMUL_FPU_opmask, ctxt, ops) == X86EMUL_OKAY )
@@ -3741,6 +3848,7 @@ x86_emulate(
         put_fpu(X86EMUL_FPU_opmask, false, state, ctxt, ops);
         fpu_type = X86EMUL_FPU_none;
     }
+#endif /* !X86EMUL_NO_SIMD */
 
     /* Decode (but don't fetch) the destination operand: register or memory. */
     switch ( d & DstMask )
@@ -3926,13 +4034,11 @@ x86_emulate(
         break;
 
     case 0x38: case 0x39: cmp: /* cmp reg,mem */
-        if ( ops->rmw && dst.type == OP_MEM &&
-             (rc = read_ulong(dst.mem.seg, dst.mem.off, &dst.val,
-                              dst.bytes, ctxt, ops)) != X86EMUL_OKAY )
-            goto done;
-        /* fall through */
+        emulate_2op_SrcV("cmp", dst, src, _regs.eflags);
+        dst.type = OP_NONE;
+        break;
+
     case 0x3a ... 0x3d: /* cmp */
-        generate_exception_if(lock_prefix, EXC_UD);
         emulate_2op_SrcV("cmp", src, dst, _regs.eflags);
         dst.type = OP_NONE;
         break;
@@ -4237,7 +4343,9 @@ x86_emulate(
         case 4: goto and;
         case 5: goto sub;
         case 6: goto xor;
-        case 7: goto cmp;
+        case 7:
+            dst.val = imm1;
+            goto cmp;
         }
         break;
 
@@ -4386,11 +4494,13 @@ x86_emulate(
         singlestep = _regs.eflags & X86_EFLAGS_TF;
         break;
 
+#ifndef X86EMUL_NO_FPU
     case 0x9b:  /* wait/fwait */
         host_and_vcpu_must_have(fpu);
         get_fpu(X86EMUL_FPU_wait);
         emulate_fpu_insn_stub(b);
         break;
+#endif
 
     case 0x9c: /* pushf */
         if ( (_regs.eflags & X86_EFLAGS_VM) &&
@@ -4800,6 +4910,7 @@ x86_emulate(
         break;
     }
 
+#ifndef X86EMUL_NO_FPU
     case 0xd8: /* FPU 0xd8 */
         host_and_vcpu_must_have(fpu);
         get_fpu(X86EMUL_FPU_fpu);
@@ -4879,9 +4990,26 @@ x86_emulate(
                 dst.bytes = 4;
                 emulate_fpu_insn_memdst(b, modrm_reg & 7, dst.val);
                 break;
-            case 4: /* fldenv - TODO */
+            case 4: /* fldenv */
+                /* Raise #MF now if there are pending unmasked exceptions. */
+                emulate_fpu_insn_stub(0xd9, 0xd0 /* fnop */);
+                /* fall through */
+            case 6: /* fnstenv */
+                fail_if(!ops->blk);
+                state->blk = modrm_reg & 2 ? blk_fst : blk_fld;
+                /*
+                 * REX is meaningless for these insns by this point - (ab)use
+                 * the field to communicate real vs protected mode to ->blk().
+                 */
+                /*state->*/rex_prefix = in_protmode(ctxt, ops);
+                if ( (rc = ops->blk(ea.mem.seg, ea.mem.off, NULL,
+                                    op_bytes > 2 ? sizeof(struct x87_env32)
+                                                 : sizeof(struct x87_env16),
+                                    &_regs.eflags,
+                                    state, ctxt)) != X86EMUL_OKAY )
+                    goto done;
                 state->fpu_ctrl = true;
-                goto unimplemented_insn;
+                break;
             case 5: /* fldcw m2byte */
                 state->fpu_ctrl = true;
             fpu_memsrc16:
@@ -4890,9 +5018,6 @@ x86_emulate(
                     goto done;
                 emulate_fpu_insn_memsrc(b, modrm_reg & 7, src.val);
                 break;
-            case 6: /* fnstenv - TODO */
-                state->fpu_ctrl = true;
-                goto unimplemented_insn;
             case 7: /* fnstcw m2byte */
                 state->fpu_ctrl = true;
             fpu_memdst16:
@@ -5045,10 +5170,26 @@ x86_emulate(
                 dst.bytes = 8;
                 emulate_fpu_insn_memdst(b, modrm_reg & 7, dst.val);
                 break;
-            case 4: /* frstor - TODO */
-            case 6: /* fnsave - TODO */
+            case 4: /* frstor */
+                /* Raise #MF now if there are pending unmasked exceptions. */
+                emulate_fpu_insn_stub(0xd9, 0xd0 /* fnop */);
+                /* fall through */
+            case 6: /* fnsave */
+                fail_if(!ops->blk);
+                state->blk = modrm_reg & 2 ? blk_fst : blk_fld;
+                /*
+                 * REX is meaningless for these insns by this point - (ab)use
+                 * the field to communicate real vs protected mode to ->blk().
+                 */
+                /*state->*/rex_prefix = in_protmode(ctxt, ops);
+                if ( (rc = ops->blk(ea.mem.seg, ea.mem.off, NULL,
+                                    op_bytes > 2 ? sizeof(struct x87_env32) + 80
+                                                 : sizeof(struct x87_env16) + 80,
+                                    &_regs.eflags,
+                                    state, ctxt)) != X86EMUL_OKAY )
+                    goto done;
                 state->fpu_ctrl = true;
-                goto unimplemented_insn;
+                break;
             case 7: /* fnstsw m2byte */
                 state->fpu_ctrl = true;
                 goto fpu_memdst16;
@@ -5134,6 +5275,7 @@ x86_emulate(
             }
         }
         break;
+#endif /* !X86EMUL_NO_FPU */
 
     case 0xe0 ... 0xe2: /* loop{,z,nz} */ {
         unsigned long count = get_loop_count(&_regs, ad_bytes);
@@ -5231,11 +5373,8 @@ x86_emulate(
             unsigned long u[2], v;
 
         case 0 ... 1: /* test */
-            generate_exception_if(lock_prefix, EXC_UD);
-            if ( ops->rmw && dst.type == OP_MEM &&
-                 (rc = read_ulong(dst.mem.seg, dst.mem.off, &dst.val,
-                                  dst.bytes, ctxt, ops)) != X86EMUL_OKAY )
-                goto done;
+            dst.val = imm1;
+            dst.bytes = src.bytes;
             goto test;
         case 2: /* not */
             if ( ops->rmw && dst.type == OP_MEM )
@@ -5639,6 +5778,40 @@ x86_emulate(
                 goto done;
             break;
 
+        case 0xe8:
+            switch ( vex.pfx )
+            {
+            case vex_none: /* serialize */
+                host_and_vcpu_must_have(serialize);
+                asm volatile ( ".byte 0x0f, 0x01, 0xe8" );
+                break;
+            case vex_f2: /* xsusldtrk */
+                vcpu_must_have(tsxldtrk);
+                /*
+                 * We're never in a transactional region when coming here
+                 * - nothing else to do.
+                 */
+                break;
+            default:
+                goto unimplemented_insn;
+            }
+            break;
+
+        case 0xe9:
+            switch ( vex.pfx )
+            {
+            case vex_f2: /* xresldtrk */
+                vcpu_must_have(tsxldtrk);
+                /*
+                 * We're never in a transactional region when coming here
+                 * - nothing else to do.
+                 */
+                break;
+            default:
+                goto unimplemented_insn;
+            }
+            break;
+
         case 0xf8: /* swapgs */
             generate_exception_if(!mode_64bit(), EXC_UD);
             generate_exception_if(!mode_ring0(), EXC_GP, 0);
@@ -6022,6 +6195,8 @@ x86_emulate(
 
             /* There's explicitly no RPL adjustment here. */
             sreg.sel = (msr_val >> 48) + 8;
+            /* But DPL needs adjustment, for the new CPL to be correct. */
+            sreg.dpl = 3;
         }
 
 #ifdef __x86_64__
@@ -6077,6 +6252,8 @@ x86_emulate(
     case X86EMUL_OPC(0x0f, 0x19) ... X86EMUL_OPC(0x0f, 0x1f): /* nop */
         break;
 
+#ifndef X86EMUL_NO_MMX
+
     case X86EMUL_OPC(0x0f, 0x0e): /* femms */
         host_and_vcpu_must_have(3dnow);
         asm volatile ( "femms" );
@@ -6097,38 +6274,70 @@ x86_emulate(
         state->simd_size = simd_other;
         goto simd_0f_imm8;
 
-#define CASE_SIMD_PACKED_INT(pfx, opc)       \
+#endif /* !X86EMUL_NO_MMX */
+
+#if !defined(X86EMUL_NO_SIMD) && !defined(X86EMUL_NO_MMX)
+# define CASE_SIMD_PACKED_INT(pfx, opc)      \
     case X86EMUL_OPC(pfx, opc):              \
     case X86EMUL_OPC_66(pfx, opc)
-#define CASE_SIMD_PACKED_INT_VEX(pfx, opc)   \
+#elif !defined(X86EMUL_NO_SIMD)
+# define CASE_SIMD_PACKED_INT(pfx, opc)      \
+    case X86EMUL_OPC_66(pfx, opc)
+#elif !defined(X86EMUL_NO_MMX)
+# define CASE_SIMD_PACKED_INT(pfx, opc)      \
+    case X86EMUL_OPC(pfx, opc)
+#else
+# define CASE_SIMD_PACKED_INT(pfx, opc) C##pfx##_##opc
+#endif
+
+#ifndef X86EMUL_NO_SIMD
+
+# define CASE_SIMD_PACKED_INT_VEX(pfx, opc)  \
     CASE_SIMD_PACKED_INT(pfx, opc):          \
     case X86EMUL_OPC_VEX_66(pfx, opc)
 
-#define CASE_SIMD_ALL_FP(kind, pfx, opc)     \
+# define CASE_SIMD_ALL_FP(kind, pfx, opc)    \
     CASE_SIMD_PACKED_FP(kind, pfx, opc):     \
     CASE_SIMD_SCALAR_FP(kind, pfx, opc)
-#define CASE_SIMD_PACKED_FP(kind, pfx, opc)  \
+# define CASE_SIMD_PACKED_FP(kind, pfx, opc) \
     case X86EMUL_OPC##kind(pfx, opc):        \
     case X86EMUL_OPC##kind##_66(pfx, opc)
-#define CASE_SIMD_SCALAR_FP(kind, pfx, opc)  \
+# define CASE_SIMD_SCALAR_FP(kind, pfx, opc) \
     case X86EMUL_OPC##kind##_F3(pfx, opc):   \
     case X86EMUL_OPC##kind##_F2(pfx, opc)
-#define CASE_SIMD_SINGLE_FP(kind, pfx, opc)  \
+# define CASE_SIMD_SINGLE_FP(kind, pfx, opc) \
     case X86EMUL_OPC##kind(pfx, opc):        \
     case X86EMUL_OPC##kind##_F3(pfx, opc)
 
-#define CASE_SIMD_ALL_FP_VEX(pfx, opc)       \
+# define CASE_SIMD_ALL_FP_VEX(pfx, opc)      \
     CASE_SIMD_ALL_FP(, pfx, opc):            \
     CASE_SIMD_ALL_FP(_VEX, pfx, opc)
-#define CASE_SIMD_PACKED_FP_VEX(pfx, opc)    \
+# define CASE_SIMD_PACKED_FP_VEX(pfx, opc)   \
     CASE_SIMD_PACKED_FP(, pfx, opc):         \
     CASE_SIMD_PACKED_FP(_VEX, pfx, opc)
-#define CASE_SIMD_SCALAR_FP_VEX(pfx, opc)    \
+# define CASE_SIMD_SCALAR_FP_VEX(pfx, opc)   \
     CASE_SIMD_SCALAR_FP(, pfx, opc):         \
     CASE_SIMD_SCALAR_FP(_VEX, pfx, opc)
-#define CASE_SIMD_SINGLE_FP_VEX(pfx, opc)    \
+# define CASE_SIMD_SINGLE_FP_VEX(pfx, opc)   \
     CASE_SIMD_SINGLE_FP(, pfx, opc):         \
     CASE_SIMD_SINGLE_FP(_VEX, pfx, opc)
+
+#else
+
+# define CASE_SIMD_PACKED_INT_VEX(pfx, opc)  \
+    CASE_SIMD_PACKED_INT(pfx, opc)
+
+# define CASE_SIMD_ALL_FP(kind, pfx, opc)    C##kind##pfx##_##opc
+# define CASE_SIMD_PACKED_FP(kind, pfx, opc) Cp##kind##pfx##_##opc
+# define CASE_SIMD_SCALAR_FP(kind, pfx, opc) Cs##kind##pfx##_##opc
+# define CASE_SIMD_SINGLE_FP(kind, pfx, opc) C##kind##pfx##_##opc
+
+# define CASE_SIMD_ALL_FP_VEX(pfx, opc)    CASE_SIMD_ALL_FP(, pfx, opc)
+# define CASE_SIMD_PACKED_FP_VEX(pfx, opc) CASE_SIMD_PACKED_FP(, pfx, opc)
+# define CASE_SIMD_SCALAR_FP_VEX(pfx, opc) CASE_SIMD_SCALAR_FP(, pfx, opc)
+# define CASE_SIMD_SINGLE_FP_VEX(pfx, opc) CASE_SIMD_SINGLE_FP(, pfx, opc)
+
+#endif
 
     CASE_SIMD_SCALAR_FP(, 0x0f, 0x2b):     /* movnts{s,d} xmm,mem */
         host_and_vcpu_must_have(sse4a);
@@ -6267,6 +6476,8 @@ x86_emulate(
         insn_bytes = EVEX_PFX_BYTES + 2;
         break;
 
+#ifndef X86EMUL_NO_SIMD
+
     case X86EMUL_OPC_66(0x0f, 0x12):       /* movlpd m64,xmm */
     case X86EMUL_OPC_VEX_66(0x0f, 0x12):   /* vmovlpd m64,xmm,xmm */
     CASE_SIMD_PACKED_FP_VEX(0x0f, 0x13):   /* movlp{s,d} xmm,m64 */
@@ -6373,6 +6584,8 @@ x86_emulate(
         avx512_vlen_check(false);
         goto simd_zmm;
 
+#endif /* !X86EMUL_NO_SIMD */
+
     case X86EMUL_OPC(0x0f, 0x20): /* mov cr,reg */
     case X86EMUL_OPC(0x0f, 0x21): /* mov dr,reg */
     case X86EMUL_OPC(0x0f, 0x22): /* mov reg,cr */
@@ -6399,6 +6612,8 @@ x86_emulate(
             goto done;
         break;
 
+#if !defined(X86EMUL_NO_MMX) && !defined(X86EMUL_NO_SIMD)
+
     case X86EMUL_OPC_66(0x0f, 0x2a):       /* cvtpi2pd mm/m64,xmm */
         if ( ea.type == OP_REG )
         {
@@ -6409,6 +6624,8 @@ x86_emulate(
         }
         op_bytes = (b & 4) && (vex.pfx & VEX_PREFIX_DOUBLE_MASK) ? 16 : 8;
         goto simd_0f_fp;
+
+#endif /* !X86EMUL_NO_MMX && !X86EMUL_NO_SIMD */
 
     CASE_SIMD_SCALAR_FP_VEX(0x0f, 0x2a):   /* {,v}cvtsi2s{s,d} r/m,xmm */
         if ( vex.opcx == vex_none )
@@ -6756,6 +6973,8 @@ x86_emulate(
             dst.val = src.val;
         break;
 
+#ifndef X86EMUL_NO_SIMD
+
     case X86EMUL_OPC_VEX(0x0f, 0x4a):    /* kadd{w,q} k,k,k */
         if ( !vex.w )
             host_and_vcpu_must_have(avx512dq);
@@ -6809,6 +7028,8 @@ x86_emulate(
     case X86EMUL_OPC_VEX_66(0x0f, 0x4b): /* kunpckbw k,k,k */
         generate_exception_if(!vex.l || vex.w, EXC_UD);
         goto opmask_common;
+
+#endif /* X86EMUL_NO_SIMD */
 
     CASE_SIMD_PACKED_FP_VEX(0x0f, 0x50):   /* movmskp{s,d} xmm,reg */
                                            /* vmovmskp{s,d} {x,y}mm,reg */
@@ -6893,6 +7114,8 @@ x86_emulate(
                          evex.w);
         goto avx512f_all_fp;
 
+#ifndef X86EMUL_NO_SIMD
+
     CASE_SIMD_PACKED_FP_VEX(0x0f, 0x5b):   /* cvt{ps,dq}2{dq,ps} xmm/mem,xmm */
                                            /* vcvt{ps,dq}2{dq,ps} {x,y}mm/mem,{x,y}mm */
     case X86EMUL_OPC_F3(0x0f, 0x5b):       /* cvttps2dq xmm/mem,xmm */
@@ -6923,6 +7146,8 @@ x86_emulate(
         op_bytes = 16 << evex.lr;
         goto simd_zmm;
 
+#endif /* !X86EMUL_NO_SIMD */
+
     CASE_SIMD_PACKED_INT_VEX(0x0f, 0x60): /* punpcklbw {,x}mm/mem,{,x}mm */
                                           /* vpunpcklbw {x,y}mm/mem,{x,y}mm,{x,y}mm */
     CASE_SIMD_PACKED_INT_VEX(0x0f, 0x61): /* punpcklwd {,x}mm/mem,{,x}mm */
@@ -6949,6 +7174,7 @@ x86_emulate(
                                           /* vpackusbw {x,y}mm/mem,{x,y}mm,{x,y}mm */
     CASE_SIMD_PACKED_INT_VEX(0x0f, 0x6b): /* packsswd {,x}mm/mem,{,x}mm */
                                           /* vpacksswd {x,y}mm/mem,{x,y}mm,{x,y}mm */
+#ifndef X86EMUL_NO_SIMD
     case X86EMUL_OPC_66(0x0f, 0x6c):     /* punpcklqdq xmm/m128,xmm */
     case X86EMUL_OPC_VEX_66(0x0f, 0x6c): /* vpunpcklqdq {x,y}mm/mem,{x,y}mm,{x,y}mm */
     case X86EMUL_OPC_66(0x0f, 0x6d):     /* punpckhqdq xmm/m128,xmm */
@@ -7033,6 +7259,7 @@ x86_emulate(
                                           /* vpsubd {x,y}mm/mem,{x,y}mm,{x,y}mm */
     case X86EMUL_OPC_66(0x0f, 0xfb):     /* psubq xmm/m128,xmm */
     case X86EMUL_OPC_VEX_66(0x0f, 0xfb): /* vpsubq {x,y}mm/mem,{x,y}mm,{x,y}mm */
+#endif /* !X86EMUL_NO_SIMD */
     CASE_SIMD_PACKED_INT_VEX(0x0f, 0xfc): /* paddb {,x}mm/mem,{,x}mm */
                                           /* vpaddb {x,y}mm/mem,{x,y}mm,{x,y}mm */
     CASE_SIMD_PACKED_INT_VEX(0x0f, 0xfd): /* paddw {,x}mm/mem,{,x}mm */
@@ -7040,6 +7267,7 @@ x86_emulate(
     CASE_SIMD_PACKED_INT_VEX(0x0f, 0xfe): /* paddd {,x}mm/mem,{,x}mm */
                                           /* vpaddd {x,y}mm/mem,{x,y}mm,{x,y}mm */
     simd_0f_int:
+#ifndef X86EMUL_NO_SIMD
         if ( vex.opcx != vex_none )
         {
     case X86EMUL_OPC_VEX_66(0x0f38, 0x00): /* vpshufb {x,y}mm/mem,{x,y}mm,{x,y}mm */
@@ -7081,10 +7309,13 @@ x86_emulate(
         }
         if ( vex.pfx )
             goto simd_0f_sse2;
+#endif /* !X86EMUL_NO_SIMD */
     simd_0f_mmx:
         host_and_vcpu_must_have(mmx);
         get_fpu(X86EMUL_FPU_mmx);
         goto simd_0f_common;
+
+#ifndef X86EMUL_NO_SIMD
 
     case X86EMUL_OPC_EVEX_66(0x0f, 0xf6): /* vpsadbw [xyz]mm/mem,[xyz]mm,[xyz]mm */
         generate_exception_if(evex.opmsk, EXC_UD);
@@ -7179,6 +7410,8 @@ x86_emulate(
         generate_exception_if(!evex.w, EXC_UD);
         goto avx512f_no_sae;
 
+#endif /* X86EMUL_NO_SIMD */
+
     CASE_SIMD_PACKED_INT_VEX(0x0f, 0x6e): /* mov{d,q} r/m,{,x}mm */
                                           /* vmov{d,q} r/m,xmm */
     CASE_SIMD_PACKED_INT_VEX(0x0f, 0x7e): /* mov{d,q} {,x}mm,r/m */
@@ -7219,6 +7452,8 @@ x86_emulate(
         put_stub(stub);
         ASSERT(!state->simd_size);
         break;
+
+#ifndef X86EMUL_NO_SIMD
 
     case X86EMUL_OPC_EVEX_66(0x0f, 0x6e): /* vmov{d,q} r/m,xmm */
     case X86EMUL_OPC_EVEX_66(0x0f, 0x7e): /* vmov{d,q} xmm,r/m */
@@ -7292,11 +7527,15 @@ x86_emulate(
         d |= TwoOp;
         /* fall through */
     case X86EMUL_OPC_66(0x0f, 0xd6):     /* movq xmm,xmm/m64 */
+#endif /* !X86EMUL_NO_SIMD */
+#ifndef X86EMUL_NO_MMX
     case X86EMUL_OPC(0x0f, 0x6f):        /* movq mm/m64,mm */
     case X86EMUL_OPC(0x0f, 0x7f):        /* movq mm,mm/m64 */
+#endif
         op_bytes = 8;
         goto simd_0f_int;
 
+#ifndef X86EMUL_NO_SIMD
     CASE_SIMD_PACKED_INT_VEX(0x0f, 0x70):/* pshuf{w,d} $imm8,{,x}mm/mem,{,x}mm */
                                          /* vpshufd $imm8,{x,y}mm/mem,{x,y}mm */
     case X86EMUL_OPC_F3(0x0f, 0x70):     /* pshufhw $imm8,xmm/m128,xmm */
@@ -7305,12 +7544,15 @@ x86_emulate(
     case X86EMUL_OPC_VEX_F2(0x0f, 0x70): /* vpshuflw $imm8,{x,y}mm/mem,{x,y}mm */
         d = (d & ~SrcMask) | SrcMem | TwoOp;
         op_bytes = vex.pfx ? 16 << vex.l : 8;
+#endif
     simd_0f_int_imm8:
         if ( vex.opcx != vex_none )
         {
+#ifndef X86EMUL_NO_SIMD
     case X86EMUL_OPC_VEX_66(0x0f3a, 0x0e): /* vpblendw $imm8,{x,y}mm/mem,{x,y}mm,{x,y}mm */
     case X86EMUL_OPC_VEX_66(0x0f3a, 0x0f): /* vpalignr $imm8,{x,y}mm/mem,{x,y}mm,{x,y}mm */
     case X86EMUL_OPC_VEX_66(0x0f3a, 0x42): /* vmpsadbw $imm8,{x,y}mm/mem,{x,y}mm,{x,y}mm */
+#endif
             if ( vex.l )
             {
     simd_0f_imm8_avx2:
@@ -7318,6 +7560,7 @@ x86_emulate(
             }
             else
             {
+#ifndef X86EMUL_NO_SIMD
     case X86EMUL_OPC_VEX_66(0x0f3a, 0x08): /* vroundps $imm8,{x,y}mm/mem,{x,y}mm */
     case X86EMUL_OPC_VEX_66(0x0f3a, 0x09): /* vroundpd $imm8,{x,y}mm/mem,{x,y}mm */
     case X86EMUL_OPC_VEX_66(0x0f3a, 0x0a): /* vroundss $imm8,{x,y}mm/mem,{x,y}mm,{x,y}mm */
@@ -7325,6 +7568,7 @@ x86_emulate(
     case X86EMUL_OPC_VEX_66(0x0f3a, 0x0c): /* vblendps $imm8,{x,y}mm/mem,{x,y}mm,{x,y}mm */
     case X86EMUL_OPC_VEX_66(0x0f3a, 0x0d): /* vblendpd $imm8,{x,y}mm/mem,{x,y}mm,{x,y}mm */
     case X86EMUL_OPC_VEX_66(0x0f3a, 0x40): /* vdpps $imm8,{x,y}mm/mem,{x,y}mm,{x,y}mm */
+#endif
     simd_0f_imm8_avx:
                 host_and_vcpu_must_have(avx);
             }
@@ -7357,6 +7601,8 @@ x86_emulate(
         opc[2] = imm1;
         insn_bytes = PFX_BYTES + 3;
         break;
+
+#ifndef X86EMUL_NO_SIMD
 
     case X86EMUL_OPC_EVEX_66(0x0f, 0x70): /* vpshufd $imm8,[xyz]mm/mem,[xyz]mm{k} */
     case X86EMUL_OPC_EVEX_F3(0x0f, 0x70): /* vpshufhw $imm8,[xyz]mm/mem,[xyz]mm{k} */
@@ -7416,6 +7662,9 @@ x86_emulate(
         opc[1] = modrm;
         opc[2] = imm1;
         insn_bytes = PFX_BYTES + 3;
+
+#endif /* X86EMUL_NO_SIMD */
+
     simd_0f_reg_only:
         opc[insn_bytes - PFX_BYTES] = 0xc3;
 
@@ -7425,6 +7674,8 @@ x86_emulate(
         put_stub(stub);
         ASSERT(!state->simd_size);
         break;
+
+#ifndef X86EMUL_NO_SIMD
 
     case X86EMUL_OPC_EVEX_66(0x0f, 0x71): /* Grp12 */
         switch ( modrm_reg & 7 )
@@ -7457,6 +7708,9 @@ x86_emulate(
         }
         goto unrecognized_insn;
 
+#endif /* !X86EMUL_NO_SIMD */
+#ifndef X86EMUL_NO_MMX
+
     case X86EMUL_OPC(0x0f, 0x73):        /* Grp14 */
         switch ( modrm_reg & 7 )
         {
@@ -7465,6 +7719,9 @@ x86_emulate(
             goto simd_0f_shift_imm;
         }
         goto unrecognized_insn;
+
+#endif /* !X86EMUL_NO_MMX */
+#ifndef X86EMUL_NO_SIMD
 
     case X86EMUL_OPC_66(0x0f, 0x73):
     case X86EMUL_OPC_VEX_66(0x0f, 0x73):
@@ -7496,7 +7753,12 @@ x86_emulate(
         }
         goto unrecognized_insn;
 
+#endif /* !X86EMUL_NO_SIMD */
+
+#ifndef X86EMUL_NO_MMX
     case X86EMUL_OPC(0x0f, 0x77):        /* emms */
+#endif
+#ifndef X86EMUL_NO_SIMD
     case X86EMUL_OPC_VEX(0x0f, 0x77):    /* vzero{all,upper} */
         if ( vex.opcx != vex_none )
         {
@@ -7542,6 +7804,7 @@ x86_emulate(
 #endif
         }
         else
+#endif /* !X86EMUL_NO_SIMD */
         {
             host_and_vcpu_must_have(mmx);
             get_fpu(X86EMUL_FPU_mmx);
@@ -7554,6 +7817,8 @@ x86_emulate(
         opc[0] = b;
         insn_bytes = PFX_BYTES + 1;
         goto simd_0f_reg_only;
+
+#ifndef X86EMUL_NO_SIMD
 
     case X86EMUL_OPC_66(0x0f, 0x78):     /* Grp17 */
         switch ( modrm_reg & 7 )
@@ -7652,6 +7917,8 @@ x86_emulate(
         op_bytes = 8;
         goto simd_zmm;
 
+#endif /* !X86EMUL_NO_SIMD */
+
     case X86EMUL_OPC(0x0f, 0x80) ... X86EMUL_OPC(0x0f, 0x8f): /* jcc (near) */
         if ( test_cc(b, _regs.eflags) )
             jmp_rel((int32_t)src.val);
@@ -7661,6 +7928,8 @@ x86_emulate(
     case X86EMUL_OPC(0x0f, 0x90) ... X86EMUL_OPC(0x0f, 0x9f): /* setcc */
         dst.val = test_cc(b, _regs.eflags);
         break;
+
+#ifndef X86EMUL_NO_SIMD
 
     case X86EMUL_OPC_VEX(0x0f, 0x91):    /* kmov{w,q} k,mem */
     case X86EMUL_OPC_VEX_66(0x0f, 0x91): /* kmov{b,d} k,mem */
@@ -7810,6 +8079,8 @@ x86_emulate(
         dst.type = OP_NONE;
         break;
 
+#endif /* !X86EMUL_NO_SIMD */
+
     case X86EMUL_OPC(0x0f, 0xa2): /* cpuid */
         msr_val = 0;
         fail_if(ops->cpuid == NULL);
@@ -7906,6 +8177,50 @@ x86_emulate(
     case X86EMUL_OPC(0x0f, 0xae): case X86EMUL_OPC_66(0x0f, 0xae): /* Grp15 */
         switch ( modrm_reg & 7 )
         {
+#if !defined(X86EMUL_NO_FPU) || !defined(X86EMUL_NO_MMX) || \
+    !defined(X86EMUL_NO_SIMD)
+        case 0: /* fxsave */
+        case 1: /* fxrstor */
+            generate_exception_if(vex.pfx, EXC_UD);
+            vcpu_must_have(fxsr);
+            generate_exception_if(ea.type != OP_MEM, EXC_UD);
+            generate_exception_if(!is_aligned(ea.mem.seg, ea.mem.off, 16,
+                                              ctxt, ops),
+                                  EXC_GP, 0);
+            fail_if(!ops->blk);
+            op_bytes =
+#ifdef __x86_64__
+                !mode_64bit() ? offsetof(struct x86_fxsr, xmm[8]) :
+#endif
+                sizeof(struct x86_fxsr);
+            if ( amd_like(ctxt) )
+            {
+                /* Assume "normal" operation in case of missing hooks. */
+                if ( !ops->read_cr ||
+                     ops->read_cr(4, &cr4, ctxt) != X86EMUL_OKAY )
+                    cr4 = X86_CR4_OSFXSR;
+                if ( !ops->read_msr ||
+                     ops->read_msr(MSR_EFER, &msr_val, ctxt) != X86EMUL_OKAY )
+                    msr_val = 0;
+                if ( !(cr4 & X86_CR4_OSFXSR) ||
+                     (mode_64bit() && mode_ring0() && (msr_val & EFER_FFXSE)) )
+                    op_bytes = offsetof(struct x86_fxsr, xmm[0]);
+            }
+            /*
+             * This could also be X86EMUL_FPU_mmx, but it shouldn't be
+             * X86EMUL_FPU_xmm, as we don't want CR4.OSFXSR checked.
+             */
+            get_fpu(X86EMUL_FPU_fpu);
+            state->fpu_ctrl = true;
+            state->blk = modrm_reg & 1 ? blk_fxrstor : blk_fxsave;
+            if ( (rc = ops->blk(ea.mem.seg, ea.mem.off, NULL,
+                                sizeof(struct x86_fxsr), &_regs.eflags,
+                                state, ctxt)) != X86EMUL_OKAY )
+                goto done;
+            break;
+#endif /* X86EMUL_NO_{FPU,MMX,SIMD} */
+
+#ifndef X86EMUL_NO_SIMD
         case 2: /* ldmxcsr */
             generate_exception_if(vex.pfx, EXC_UD);
             vcpu_must_have(sse);
@@ -7924,6 +8239,7 @@ x86_emulate(
             get_fpu(vex.opcx ? X86EMUL_FPU_ymm : X86EMUL_FPU_xmm);
             asm volatile ( "stmxcsr %0" : "=m" (dst.val) );
             break;
+#endif /* X86EMUL_NO_SIMD */
 
         case 5: /* lfence */
             fail_if(modrm_mod != 3);
@@ -7972,6 +8288,8 @@ x86_emulate(
         }
         break;
 
+#ifndef X86EMUL_NO_SIMD
+
     case X86EMUL_OPC_VEX(0x0f, 0xae): /* Grp15 */
         switch ( modrm_reg & 7 )
         {
@@ -7985,6 +8303,8 @@ x86_emulate(
             goto stmxcsr;
         }
         goto unrecognized_insn;
+
+#endif /* !X86EMUL_NO_SIMD */
 
     case X86EMUL_OPC_F3(0x0f, 0xae): /* Grp15 */
         fail_if(modrm_mod != 3);
@@ -8225,6 +8545,8 @@ x86_emulate(
         }
         goto simd_0f_imm8_avx;
 
+#ifndef X86EMUL_NO_SIMD
+
     CASE_SIMD_ALL_FP(_EVEX, 0x0f, 0xc2): /* vcmp{p,s}{s,d} $imm8,[xyz]mm/mem,[xyz]mm,k{k} */
         generate_exception_if((evex.w != (evex.pfx & VEX_PREFIX_DOUBLE_MASK) ||
                                (ea.type != OP_REG && evex.brs &&
@@ -8251,6 +8573,8 @@ x86_emulate(
         insn_bytes = EVEX_PFX_BYTES + 3;
         break;
 
+#endif /* !X86EMUL_NO_SIMD */
+
     case X86EMUL_OPC(0x0f, 0xc3): /* movnti */
         /* Ignore the non-temporal hint for now. */
         vcpu_must_have(sse2);
@@ -8264,6 +8588,8 @@ x86_emulate(
         memcpy(mmvalp, &src.val, 2);
         ea.type = OP_MEM;
         goto simd_0f_int_imm8;
+
+#ifndef X86EMUL_NO_SIMD
 
     case X86EMUL_OPC_EVEX_66(0x0f, 0xc4):   /* vpinsrw $imm8,r32/m16,xmm,xmm */
     case X86EMUL_OPC_EVEX_66(0x0f3a, 0x20): /* vpinsrb $imm8,r32/m8,xmm,xmm */
@@ -8282,6 +8608,8 @@ x86_emulate(
         state->simd_size = simd_other;
         goto avx512f_imm8_no_sae;
 
+#endif /* !X86EMUL_NO_SIMD */
+
     CASE_SIMD_PACKED_INT_VEX(0x0f, 0xc5):  /* pextrw $imm8,{,x}mm,reg */
                                            /* vpextrw $imm8,xmm,reg */
         generate_exception_if(vex.l, EXC_UD);
@@ -8297,6 +8625,8 @@ x86_emulate(
         insn_bytes = PFX_BYTES + 3;
         goto simd_0f_to_gpr;
 
+#ifndef X86EMUL_NO_SIMD
+
     CASE_SIMD_PACKED_FP(_EVEX, 0x0f, 0xc6): /* vshufp{s,d} $imm8,[xyz]mm/mem,[xyz]mm,[xyz]mm{k} */
         generate_exception_if(evex.w != (evex.pfx & VEX_PREFIX_DOUBLE_MASK),
                               EXC_UD);
@@ -8310,6 +8640,8 @@ x86_emulate(
         generate_exception_if(ea.type != OP_MEM && evex.brs, EXC_UD);
         avx512_vlen_check(false);
         goto simd_imm8_zmm;
+
+#endif /* X86EMUL_NO_SIMD */
 
     case X86EMUL_OPC(0x0f, 0xc7): /* Grp9 */
     {
@@ -8501,6 +8833,8 @@ x86_emulate(
         }
         break;
 
+#ifndef X86EMUL_NO_SIMD
+
     case X86EMUL_OPC_EVEX_66(0x0f, 0xd2): /* vpsrld xmm/m128,[xyz]mm,[xyz]mm{k} */
     case X86EMUL_OPC_EVEX_66(0x0f, 0xd3): /* vpsrlq xmm/m128,[xyz]mm,[xyz]mm{k} */
     case X86EMUL_OPC_EVEX_66(0x0f, 0xe2): /* vpsra{d,q} xmm/m128,[xyz]mm,[xyz]mm{k} */
@@ -8522,11 +8856,17 @@ x86_emulate(
         generate_exception_if(evex.w != (b & 1), EXC_UD);
         goto avx512f_no_sae;
 
+#endif /* !X86EMUL_NO_SIMD */
+#ifndef X86EMUL_NO_MMX
+
     case X86EMUL_OPC(0x0f, 0xd4):        /* paddq mm/m64,mm */
     case X86EMUL_OPC(0x0f, 0xf4):        /* pmuludq mm/m64,mm */
     case X86EMUL_OPC(0x0f, 0xfb):        /* psubq mm/m64,mm */
         vcpu_must_have(sse2);
         goto simd_0f_mmx;
+
+#endif /* !X86EMUL_NO_MMX */
+#if !defined(X86EMUL_NO_MMX) && !defined(X86EMUL_NO_SIMD)
 
     case X86EMUL_OPC_F3(0x0f, 0xd6):     /* movq2dq mm,xmm */
     case X86EMUL_OPC_F2(0x0f, 0xd6):     /* movdq2q xmm,mm */
@@ -8534,6 +8874,9 @@ x86_emulate(
         op_bytes = 8;
         host_and_vcpu_must_have(mmx);
         goto simd_0f_int;
+
+#endif /* !X86EMUL_NO_MMX && !X86EMUL_NO_SIMD */
+#ifndef X86EMUL_NO_MMX
 
     case X86EMUL_OPC(0x0f, 0xe7):        /* movntq mm,m64 */
         generate_exception_if(ea.type != OP_MEM, EXC_UD);
@@ -8549,6 +8892,9 @@ x86_emulate(
     case X86EMUL_OPC(0x0f, 0xf6):        /* psadbw mm/m64,mm */
         vcpu_must_have(mmxext);
         goto simd_0f_mmx;
+
+#endif /* !X86EMUL_NO_MMX */
+#ifndef X86EMUL_NO_SIMD
 
     case X86EMUL_OPC_EVEX_66(0x0f, 0xda): /* vpminub [xyz]mm/mem,[xyz]mm,[xyz]mm{k} */
     case X86EMUL_OPC_EVEX_66(0x0f, 0xde): /* vpmaxub [xyz]mm/mem,[xyz]mm,[xyz]mm{k} */
@@ -8569,6 +8915,8 @@ x86_emulate(
         d |= TwoOp;
         op_bytes = 8 << (!!(vex.pfx & VEX_PREFIX_DOUBLE_MASK) + vex.l);
         goto simd_0f_cvt;
+
+#endif /* !X86EMUL_NO_SIMD */
 
     CASE_SIMD_PACKED_INT_VEX(0x0f, 0xf7): /* {,v}maskmov{q,dqu} {,x}mm,{,x}mm */
         generate_exception_if(ea.type != OP_REG, EXC_UD);
@@ -8672,6 +9020,8 @@ x86_emulate(
         }
         insn_bytes = PFX_BYTES + 3;
         break;
+
+#ifndef X86EMUL_NO_SIMD
 
     case X86EMUL_OPC_VEX_66(0x0f38, 0x19): /* vbroadcastsd xmm/m64,ymm */
     case X86EMUL_OPC_VEX_66(0x0f38, 0x1a): /* vbroadcastf128 m128,ymm */
@@ -9255,6 +9605,8 @@ x86_emulate(
         ASSERT(!state->simd_size);
         break;
 
+#endif /* !X86EMUL_NO_SIMD */
+
     case X86EMUL_OPC_66(0x0f38, 0x82): /* invpcid reg,m128 */
         vcpu_must_have(invpcid);
         generate_exception_if(ea.type != OP_MEM, EXC_UD);
@@ -9296,6 +9648,8 @@ x86_emulate(
 
         state->simd_size = simd_none;
         break;
+
+#ifndef X86EMUL_NO_SIMD
 
     case X86EMUL_OPC_EVEX_66(0x0f38, 0x83): /* vpmultishiftqb [xyz]mm/mem,[xyz]mm,[xyz]mm{k} */
         generate_exception_if(!evex.w, EXC_UD);
@@ -9860,6 +10214,8 @@ x86_emulate(
         generate_exception_if(evex.brs || evex.opmsk, EXC_UD);
         goto avx512f_no_sae;
 
+#endif /* !X86EMUL_NO_SIMD */
+
     case X86EMUL_OPC(0x0f38, 0xf0): /* movbe m,r */
     case X86EMUL_OPC(0x0f38, 0xf1): /* movbe r,m */
         vcpu_must_have(movbe);
@@ -10025,6 +10381,66 @@ x86_emulate(
                             : "0" ((uint32_t)src.val), "rm" (_regs.edx) );
         break;
 
+    case X86EMUL_OPC_66(0x0f38, 0xf8): /* movdir64b r,m512 */
+        host_and_vcpu_must_have(movdir64b);
+        generate_exception_if(ea.type != OP_MEM, EXC_UD);
+        src.val = truncate_ea(*dst.reg);
+        generate_exception_if(!is_aligned(x86_seg_es, src.val, 64, ctxt, ops),
+                              EXC_GP, 0);
+        fail_if(!ops->blk);
+        state->blk = blk_movdir;
+        BUILD_BUG_ON(sizeof(*mmvalp) < 64);
+        if ( (rc = ops->read(ea.mem.seg, ea.mem.off, mmvalp, 64,
+                             ctxt)) != X86EMUL_OKAY ||
+             (rc = ops->blk(x86_seg_es, src.val, mmvalp, 64, &_regs.eflags,
+                            state, ctxt)) != X86EMUL_OKAY )
+            goto done;
+        state->simd_size = simd_none;
+        break;
+
+    case X86EMUL_OPC_F2(0x0f38, 0xf8): /* enqcmd r,m512 */
+    case X86EMUL_OPC_F3(0x0f38, 0xf8): /* enqcmds r,m512 */
+        host_and_vcpu_must_have(enqcmd);
+        generate_exception_if(ea.type != OP_MEM, EXC_UD);
+        generate_exception_if(vex.pfx != vex_f2 && !mode_ring0(), EXC_GP, 0);
+        src.val = truncate_ea(*dst.reg);
+        generate_exception_if(!is_aligned(x86_seg_es, src.val, 64, ctxt, ops),
+                              EXC_GP, 0);
+        fail_if(!ops->blk);
+        BUILD_BUG_ON(sizeof(*mmvalp) < 64);
+        if ( (rc = ops->read(ea.mem.seg, ea.mem.off, mmvalp, 64,
+                             ctxt)) != X86EMUL_OKAY )
+            goto done;
+        if ( vex.pfx == vex_f2 ) /* enqcmd */
+        {
+            fail_if(!ops->read_msr);
+            if ( (rc = ops->read_msr(MSR_PASID, &msr_val,
+                                     ctxt)) != X86EMUL_OKAY )
+                goto done;
+            generate_exception_if(!(msr_val & PASID_VALID), EXC_GP, 0);
+            mmvalp->data32[0] = MASK_EXTR(msr_val, PASID_PASID_MASK);
+        }
+        mmvalp->data32[0] &= ~0x7ff00000;
+        state->blk = blk_enqcmd;
+        if ( (rc = ops->blk(x86_seg_es, src.val, mmvalp, 64, &_regs.eflags,
+                            state, ctxt)) != X86EMUL_OKAY )
+            goto done;
+        state->simd_size = simd_none;
+        break;
+
+    case X86EMUL_OPC(0x0f38, 0xf9): /* movdiri mem,r */
+        host_and_vcpu_must_have(movdiri);
+        generate_exception_if(dst.type != OP_MEM, EXC_UD);
+        fail_if(!ops->blk);
+        state->blk = blk_movdir;
+        if ( (rc = ops->blk(dst.mem.seg, dst.mem.off, &src.val, op_bytes,
+                            &_regs.eflags, state, ctxt)) != X86EMUL_OKAY )
+            goto done;
+        dst.type = OP_NONE;
+        break;
+
+#ifndef X86EMUL_NO_SIMD
+
     case X86EMUL_OPC_VEX_66(0x0f3a, 0x00): /* vpermq $imm8,ymm/m256,ymm */
     case X86EMUL_OPC_VEX_66(0x0f3a, 0x01): /* vpermpd $imm8,ymm/m256,ymm */
         generate_exception_if(!vex.l || !vex.w, EXC_UD);
@@ -10085,6 +10501,8 @@ x86_emulate(
         avx512_vlen_check(b & 2);
         goto simd_imm8_zmm;
 
+#endif /* X86EMUL_NO_SIMD */
+
     CASE_SIMD_PACKED_INT(0x0f3a, 0x0f): /* palignr $imm8,{,x}mm/mem,{,x}mm */
         host_and_vcpu_must_have(ssse3);
         if ( vex.pfx )
@@ -10111,6 +10529,8 @@ x86_emulate(
         opc[3] = imm1;
         insn_bytes = PFX_BYTES + 4;
         break;
+
+#ifndef X86EMUL_NO_SIMD
 
     case X86EMUL_OPC_EVEX_66(0x0f3a, 0x42): /* vdbpsadbw $imm8,[xyz]mm/mem,[xyz]mm,[xyz]mm{k} */
         generate_exception_if(evex.w, EXC_UD);
@@ -10610,6 +11030,8 @@ x86_emulate(
         generate_exception_if(vex.l, EXC_UD);
         goto simd_0f_imm8_avx;
 
+#endif /* X86EMUL_NO_SIMD */
+
     case X86EMUL_OPC_VEX_F2(0x0f3a, 0xf0): /* rorx imm,r/m,r */
         vcpu_must_have(bmi2);
         generate_exception_if(vex.l || vex.reg != 0xf, EXC_UD);
@@ -10623,6 +11045,8 @@ x86_emulate(
         else
             asm ( "rorl %b1,%k0" : "=g" (dst.val) : "c" (imm1), "0" (src.val) );
         break;
+
+#ifndef X86EMUL_NO_SIMD
 
     case X86EMUL_OPC_XOP(08, 0x85): /* vpmacssww xmm,xmm/m128,xmm,xmm */
     case X86EMUL_OPC_XOP(08, 0x86): /* vpmacsswd xmm,xmm/m128,xmm,xmm */
@@ -10658,6 +11082,8 @@ x86_emulate(
                                     /* vpcmov {x,y}mm,{x,y}mm/mem,{x,y}mm,{x,y}mm */
         host_and_vcpu_must_have(xop);
         goto simd_0f_imm8_ymm;
+
+#endif /* X86EMUL_NO_SIMD */
 
     case X86EMUL_OPC_XOP(09, 0x01): /* XOP Grp1 */
         switch ( modrm_reg & 7 )
@@ -10718,6 +11144,8 @@ x86_emulate(
         }
         goto unrecognized_insn;
 
+#ifndef X86EMUL_NO_SIMD
+
     case X86EMUL_OPC_XOP(09, 0x82): /* vfrczss xmm/m128,xmm */
     case X86EMUL_OPC_XOP(09, 0x83): /* vfrczsd xmm/m128,xmm */
         generate_exception_if(vex.l, EXC_UD);
@@ -10772,6 +11200,8 @@ x86_emulate(
         generate_exception_if(vex.l, EXC_UD);
         host_and_vcpu_must_have(xop);
         goto simd_0f_ymm;
+
+#endif /* X86EMUL_NO_SIMD */
 
     case X86EMUL_OPC_XOP(0a, 0x10): /* bextr imm,r/m,r */
     {
@@ -11268,6 +11698,371 @@ int x86_emul_rmw(
     return X86EMUL_OKAY;
 }
 
+int x86_emul_blk(
+    void *ptr,
+    void *data,
+    unsigned int bytes,
+    uint32_t *eflags,
+    struct x86_emulate_state *state,
+    struct x86_emulate_ctxt *ctxt)
+{
+    int rc = X86EMUL_OKAY;
+
+    switch ( state->blk )
+    {
+        bool zf;
+#ifndef X86EMUL_NO_FPU
+        struct {
+            struct x87_env32 env;
+            struct {
+               uint8_t bytes[10];
+            } freg[8];
+        } fpstate;
+#endif
+
+        /*
+         * Throughout this switch(), memory clobbers are used to compensate
+         * that other operands may not properly express the (full) memory
+         * ranges covered.
+         */
+    case blk_enqcmd:
+        ASSERT(bytes == 64);
+        if ( ((unsigned long)ptr & 0x3f) )
+        {
+            ASSERT_UNREACHABLE();
+            return X86EMUL_UNHANDLEABLE;
+        }
+        *eflags &= ~EFLAGS_MASK;
+#ifdef HAVE_AS_ENQCMD
+        asm ( "enqcmds (%[src]), %[dst]" ASM_FLAG_OUT(, "; setz %[zf]")
+              : [zf] ASM_FLAG_OUT("=@ccz", "=qm") (zf)
+              : [src] "r" (data), [dst] "r" (ptr) : "memory" );
+#else
+        /* enqcmds (%rsi), %rdi */
+        asm ( ".byte 0xf3, 0x0f, 0x38, 0xf8, 0x3e"
+              ASM_FLAG_OUT(, "; setz %[zf]")
+              : [zf] ASM_FLAG_OUT("=@ccz", "=qm") (zf)
+              : "S" (data), "D" (ptr) : "memory" );
+#endif
+        if ( zf )
+            *eflags |= X86_EFLAGS_ZF;
+        break;
+
+#ifndef X86EMUL_NO_FPU
+
+    case blk_fld:
+        ASSERT(!data);
+
+        /* state->rex_prefix carries CR0.PE && !EFLAGS.VM setting */
+        switch ( bytes )
+        {
+        case sizeof(fpstate.env): /* 32-bit FLDENV */
+        case sizeof(fpstate):     /* 32-bit FRSTOR */
+            memcpy(&fpstate.env, ptr, sizeof(fpstate.env));
+            if ( !state->rex_prefix )
+            {
+                /* Convert 32-bit real/vm86 to 32-bit prot format. */
+                unsigned int fip = fpstate.env.mode.real.fip_lo +
+                                   (fpstate.env.mode.real.fip_hi << 16);
+                unsigned int fdp = fpstate.env.mode.real.fdp_lo +
+                                   (fpstate.env.mode.real.fdp_hi << 16);
+                unsigned int fop = fpstate.env.mode.real.fop;
+
+                fpstate.env.mode.prot.fip = fip & 0xf;
+                fpstate.env.mode.prot.fcs = fip >> 4;
+                fpstate.env.mode.prot.fop = fop;
+                fpstate.env.mode.prot.fdp = fdp & 0xf;
+                fpstate.env.mode.prot.fds = fdp >> 4;
+            }
+
+            if ( bytes == sizeof(fpstate.env) )
+                ptr = NULL;
+            else
+                ptr += sizeof(fpstate.env);
+            break;
+
+        case sizeof(struct x87_env16):                        /* 16-bit FLDENV */
+        case sizeof(struct x87_env16) + sizeof(fpstate.freg): /* 16-bit FRSTOR */
+        {
+            const struct x87_env16 *env = ptr;
+
+            fpstate.env.fcw = env->fcw;
+            fpstate.env.fsw = env->fsw;
+            fpstate.env.ftw = env->ftw;
+
+            if ( state->rex_prefix )
+            {
+                /* Convert 16-bit prot to 32-bit prot format. */
+                fpstate.env.mode.prot.fip = env->mode.prot.fip;
+                fpstate.env.mode.prot.fcs = env->mode.prot.fcs;
+                fpstate.env.mode.prot.fdp = env->mode.prot.fdp;
+                fpstate.env.mode.prot.fds = env->mode.prot.fds;
+                fpstate.env.mode.prot.fop = 0; /* unknown */
+            }
+            else
+            {
+                /* Convert 16-bit real/vm86 to 32-bit prot format. */
+                unsigned int fip = env->mode.real.fip_lo +
+                                   (env->mode.real.fip_hi << 16);
+                unsigned int fdp = env->mode.real.fdp_lo +
+                                   (env->mode.real.fdp_hi << 16);
+                unsigned int fop = env->mode.real.fop;
+
+                fpstate.env.mode.prot.fip = fip & 0xf;
+                fpstate.env.mode.prot.fcs = fip >> 4;
+                fpstate.env.mode.prot.fop = fop;
+                fpstate.env.mode.prot.fdp = fdp & 0xf;
+                fpstate.env.mode.prot.fds = fdp >> 4;
+            }
+
+            if ( bytes == sizeof(*env) )
+                ptr = NULL;
+            else
+                ptr += sizeof(*env);
+            break;
+        }
+
+        default:
+            ASSERT_UNREACHABLE();
+            return X86EMUL_UNHANDLEABLE;
+        }
+
+        if ( ptr )
+        {
+            memcpy(fpstate.freg, ptr, sizeof(fpstate.freg));
+            asm volatile ( "frstor %0" :: "m" (fpstate) );
+        }
+        else
+            asm volatile ( "fldenv %0" :: "m" (fpstate.env) );
+        break;
+
+    case blk_fst:
+        ASSERT(!data);
+
+        /* Don't chance consuming uninitialized data. */
+        memset(&fpstate, 0, sizeof(fpstate));
+        if ( bytes > sizeof(fpstate.env) )
+            asm ( "fnsave %0" : "+m" (fpstate) );
+        else
+            asm ( "fnstenv %0" : "+m" (fpstate.env) );
+
+        /* state->rex_prefix carries CR0.PE && !EFLAGS.VM setting */
+        switch ( bytes )
+        {
+        case sizeof(fpstate.env): /* 32-bit FNSTENV */
+        case sizeof(fpstate):     /* 32-bit FNSAVE */
+            if ( !state->rex_prefix )
+            {
+                /* Convert 32-bit prot to 32-bit real/vm86 format. */
+                unsigned int fip = fpstate.env.mode.prot.fip +
+                                   (fpstate.env.mode.prot.fcs << 4);
+                unsigned int fdp = fpstate.env.mode.prot.fdp +
+                                   (fpstate.env.mode.prot.fds << 4);
+                unsigned int fop = fpstate.env.mode.prot.fop;
+
+                memset(&fpstate.env.mode, 0, sizeof(fpstate.env.mode));
+                fpstate.env.mode.real.fip_lo = fip;
+                fpstate.env.mode.real.fip_hi = fip >> 16;
+                fpstate.env.mode.real.fop = fop;
+                fpstate.env.mode.real.fdp_lo = fdp;
+                fpstate.env.mode.real.fdp_hi = fdp >> 16;
+            }
+            memcpy(ptr, &fpstate.env, sizeof(fpstate.env));
+            if ( bytes == sizeof(fpstate.env) )
+                ptr = NULL;
+            else
+                ptr += sizeof(fpstate.env);
+            break;
+
+        case sizeof(struct x87_env16):                        /* 16-bit FNSTENV */
+        case sizeof(struct x87_env16) + sizeof(fpstate.freg): /* 16-bit FNSAVE */
+            if ( state->rex_prefix )
+            {
+                /* Convert 32-bit prot to 16-bit prot format. */
+                struct x87_env16 *env = ptr;
+
+                env->fcw = fpstate.env.fcw;
+                env->fsw = fpstate.env.fsw;
+                env->ftw = fpstate.env.ftw;
+                env->mode.prot.fip = fpstate.env.mode.prot.fip;
+                env->mode.prot.fcs = fpstate.env.mode.prot.fcs;
+                env->mode.prot.fdp = fpstate.env.mode.prot.fdp;
+                env->mode.prot.fds = fpstate.env.mode.prot.fds;
+            }
+            else
+            {
+                /* Convert 32-bit prot to 16-bit real/vm86 format. */
+                unsigned int fip = fpstate.env.mode.prot.fip +
+                                   (fpstate.env.mode.prot.fcs << 4);
+                unsigned int fdp = fpstate.env.mode.prot.fdp +
+                                   (fpstate.env.mode.prot.fds << 4);
+                struct x87_env16 env = {
+                    .fcw = fpstate.env.fcw,
+                    .fsw = fpstate.env.fsw,
+                    .ftw = fpstate.env.ftw,
+                    .mode.real.fip_lo = fip,
+                    .mode.real.fip_hi = fip >> 16,
+                    .mode.real.fop = fpstate.env.mode.prot.fop,
+                    .mode.real.fdp_lo = fdp,
+                    .mode.real.fdp_hi = fdp >> 16
+                };
+
+                memcpy(ptr, &env, sizeof(env));
+            }
+            if ( bytes == sizeof(struct x87_env16) )
+                ptr = NULL;
+            else
+                ptr += sizeof(struct x87_env16);
+            break;
+
+        default:
+            ASSERT_UNREACHABLE();
+            return X86EMUL_UNHANDLEABLE;
+        }
+
+        if ( ptr )
+            memcpy(ptr, fpstate.freg, sizeof(fpstate.freg));
+        break;
+
+#endif /* X86EMUL_NO_FPU */
+
+#if !defined(X86EMUL_NO_FPU) || !defined(X86EMUL_NO_MMX) || \
+    !defined(X86EMUL_NO_SIMD)
+
+    case blk_fxrstor:
+    {
+        struct x86_fxsr *fxsr = FXSAVE_AREA;
+
+        ASSERT(!data);
+        ASSERT(bytes == sizeof(*fxsr));
+        ASSERT(state->op_bytes <= bytes);
+
+        if ( state->op_bytes < sizeof(*fxsr) )
+        {
+            if ( state->rex_prefix & REX_W )
+            {
+                /*
+                 * The only way to force fxsaveq on a wide range of gas
+                 * versions. On older versions the rex64 prefix works only if
+                 * we force an addressing mode that doesn't require extended
+                 * registers.
+                 */
+                asm volatile ( ".byte 0x48; fxsave (%1)"
+                               : "=m" (*fxsr) : "R" (fxsr) );
+            }
+            else
+                asm volatile ( "fxsave %0" : "=m" (*fxsr) );
+        }
+
+        /*
+         * Don't chance the reserved or available ranges to contain any
+         * data FXRSTOR may actually consume in some way: Copy only the
+         * defined portion, and zero the rest.
+         */
+        memcpy(fxsr, ptr, min(state->op_bytes,
+                              (unsigned int)offsetof(struct x86_fxsr, rsvd)));
+        memset(fxsr->rsvd, 0, sizeof(*fxsr) - offsetof(struct x86_fxsr, rsvd));
+
+        generate_exception_if(fxsr->mxcsr & ~mxcsr_mask, EXC_GP, 0);
+
+        if ( state->rex_prefix & REX_W )
+        {
+            /* See above for why operand/constraints are this way. */
+            asm volatile ( ".byte 0x48; fxrstor (%1)"
+                           :: "m" (*fxsr), "R" (fxsr) );
+        }
+        else
+            asm volatile ( "fxrstor %0" :: "m" (*fxsr) );
+        break;
+    }
+
+    case blk_fxsave:
+    {
+        struct x86_fxsr *fxsr = FXSAVE_AREA;
+
+        ASSERT(!data);
+        ASSERT(bytes == sizeof(*fxsr));
+        ASSERT(state->op_bytes <= bytes);
+
+        if ( state->op_bytes < sizeof(*fxsr) )
+            /* Don't chance consuming uninitialized data. */
+            memset(fxsr, 0, state->op_bytes);
+        else
+            fxsr = ptr;
+
+        if ( state->rex_prefix & REX_W )
+        {
+            /* See above for why operand/constraints are this way. */
+            asm volatile ( ".byte 0x48; fxsave (%1)"
+                           : "=m" (*fxsr) : "R" (fxsr) );
+        }
+        else
+            asm volatile ( "fxsave %0" : "=m" (*fxsr) );
+
+        if ( fxsr != ptr ) /* i.e. state->op_bytes < sizeof(*fxsr) */
+            memcpy(ptr, fxsr, state->op_bytes);
+        break;
+    }
+
+#endif /* X86EMUL_NO_{FPU,MMX,SIMD} */
+
+    case blk_movdir:
+        switch ( bytes )
+        {
+#ifdef __x86_64__
+        case sizeof(uint32_t):
+# ifdef HAVE_AS_MOVDIR
+            asm ( "movdiri %0, (%1)"
+                  :: "r" (*(uint32_t *)data), "r" (ptr) : "memory" );
+# else
+            /* movdiri %esi, (%rdi) */
+            asm ( ".byte 0x0f, 0x38, 0xf9, 0x37"
+                  :: "S" (*(uint32_t *)data), "D" (ptr) : "memory" );
+# endif
+            break;
+#endif
+
+        case sizeof(unsigned long):
+#ifdef HAVE_AS_MOVDIR
+            asm ( "movdiri %0, (%1)"
+                  :: "r" (*(unsigned long *)data), "r" (ptr) : "memory" );
+#else
+            /* movdiri %rsi, (%rdi) */
+            asm ( ".byte 0x48, 0x0f, 0x38, 0xf9, 0x37"
+                  :: "S" (*(unsigned long *)data), "D" (ptr) : "memory" );
+#endif
+            break;
+
+        case 64:
+            if ( ((unsigned long)ptr & 0x3f) )
+            {
+                ASSERT_UNREACHABLE();
+                return X86EMUL_UNHANDLEABLE;
+            }
+#ifdef HAVE_AS_MOVDIR
+            asm ( "movdir64b (%0), %1" :: "r" (data), "r" (ptr) : "memory" );
+#else
+            /* movdir64b (%rsi), %rdi */
+            asm ( ".byte 0x66, 0x0f, 0x38, 0xf8, 0x3e"
+                  :: "S" (data), "D" (ptr) : "memory" );
+#endif
+            break;
+
+        default:
+            ASSERT_UNREACHABLE();
+            return X86EMUL_UNHANDLEABLE;
+        }
+        break;
+
+    default:
+        ASSERT_UNREACHABLE();
+        return X86EMUL_UNHANDLEABLE;
+    }
+
+ done:
+    return rc;
+}
+
 static void __init __maybe_unused build_assertions(void)
 {
     /* Check the values against SReg3 encoding in opcode/ModRM bytes. */
@@ -11335,10 +12130,6 @@ int x86_emulate_wrapper(
 }
 #endif
 
-#ifdef __XEN__
-
-#include <xen/err.h>
-
 struct x86_emulate_state *
 x86_decode_insn(
     struct x86_emulate_ctxt *ctxt,
@@ -11361,7 +12152,7 @@ x86_decode_insn(
     if ( unlikely(rc != X86EMUL_OKAY) )
         return ERR_PTR(-rc);
 
-#ifndef NDEBUG
+#if defined(__XEN__) && !defined(NDEBUG)
     /*
      * While we avoid memory allocation (by use of per-CPU data) above,
      * nevertheless make sure callers properly release the state structure
@@ -11381,12 +12172,12 @@ x86_decode_insn(
 
 static inline void check_state(const struct x86_emulate_state *state)
 {
-#ifndef NDEBUG
+#if defined(__XEN__) && !defined(NDEBUG)
     ASSERT(state->caller);
 #endif
 }
 
-#ifndef NDEBUG
+#if defined(__XEN__) && !defined(NDEBUG)
 void x86_emulate_free_state(struct x86_emulate_state *state)
 {
     check_state(state);
@@ -11436,24 +12227,86 @@ x86_insn_operand_ea(const struct x86_emulate_state *state,
     return state->ea.mem.off;
 }
 
+/*
+ * This function means to return 'true' for all supported insns with explicit
+ * accesses to memory.  This means also insns which don't have an explicit
+ * memory operand (like POP), but it does not mean e.g. segment selector
+ * loads, where the descriptor table access is considered an implicit one.
+ */
 bool
 x86_insn_is_mem_access(const struct x86_emulate_state *state,
                        const struct x86_emulate_ctxt *ctxt)
 {
+    if ( mode_64bit() && state->not_64bit )
+        return false;
+
     if ( state->ea.type == OP_MEM )
-        return ctxt->opcode != 0x8d /* LEA */ &&
-               (ctxt->opcode != X86EMUL_OPC(0x0f, 0x01) ||
-                (state->modrm_reg & 7) != 7) /* INVLPG */;
+    {
+        switch ( ctxt->opcode )
+        {
+        case 0x8d: /* LEA */
+        case X86EMUL_OPC(0x0f, 0x0d): /* PREFETCH */
+        case X86EMUL_OPC(0x0f, 0x18)
+         ... X86EMUL_OPC(0x0f, 0x1f): /* NOP space */
+        case X86EMUL_OPC_66(0x0f, 0x18)
+         ... X86EMUL_OPC_66(0x0f, 0x1f): /* NOP space */
+        case X86EMUL_OPC_F3(0x0f, 0x18)
+         ... X86EMUL_OPC_F3(0x0f, 0x1f): /* NOP space */
+        case X86EMUL_OPC_F2(0x0f, 0x18)
+         ... X86EMUL_OPC_F2(0x0f, 0x1f): /* NOP space */
+        case X86EMUL_OPC(0x0f, 0xb9): /* UD1 */
+        case X86EMUL_OPC(0x0f, 0xff): /* UD0 */
+            return false;
+
+        case X86EMUL_OPC(0x0f, 0x01):
+            return (state->modrm_reg & 7) != 7; /* INVLPG */
+
+        case X86EMUL_OPC(0x0f, 0xae):
+            return (state->modrm_reg & 7) != 7; /* CLFLUSH */
+
+        case X86EMUL_OPC_66(0x0f, 0xae):
+            return (state->modrm_reg & 7) < 6; /* CLWB, CLFLUSHOPT */
+        }
+
+        return true;
+    }
 
     switch ( ctxt->opcode )
     {
+    case 0x06 ... 0x07: /* PUSH / POP %es */
+    case 0x0e:          /* PUSH %cs */
+    case 0x16 ... 0x17: /* PUSH / POP %ss */
+    case 0x1e ... 0x1f: /* PUSH / POP %ds */
+    case 0x50 ... 0x5f: /* PUSH / POP reg */
+    case 0x60 ... 0x61: /* PUSHA / POPA */
+    case 0x68: case 0x6a: /* PUSH imm */
     case 0x6c ... 0x6f: /* INS / OUTS */
+    case 0x8f:          /* POP r/m */
+    case 0x9a:          /* CALL (far, direct) */
+    case 0x9c ... 0x9d: /* PUSHF / POPF */
     case 0xa4 ... 0xa7: /* MOVS / CMPS */
     case 0xaa ... 0xaf: /* STOS / LODS / SCAS */
+    case 0xc2 ... 0xc3: /* RET (near) */
+    case 0xc8 ... 0xc9: /* ENTER / LEAVE */
+    case 0xca ... 0xcb: /* RET (far) */
     case 0xd7:          /* XLAT */
+    case 0xe8:          /* CALL (near, direct) */
+    case X86EMUL_OPC(0x0f, 0xa0):         /* PUSH %fs */
+    case X86EMUL_OPC(0x0f, 0xa1):         /* POP %fs */
+    case X86EMUL_OPC(0x0f, 0xa8):         /* PUSH %gs */
+    case X86EMUL_OPC(0x0f, 0xa9):         /* POP %gs */
     CASE_SIMD_PACKED_INT_VEX(0x0f, 0xf7): /* MASKMOV{Q,DQU} */
                                           /* VMASKMOVDQU */
         return true;
+
+    case 0xff:
+        switch ( state->modrm_reg & 7 )
+        {
+        case 2: /* CALL (near, indirect) */
+        case 6: /* PUSH r/m */
+            return true;
+        }
+        break;
 
     case X86EMUL_OPC(0x0f, 0x01):
         /* Cover CLZERO. */
@@ -11463,10 +12316,20 @@ x86_insn_is_mem_access(const struct x86_emulate_state *state,
     return false;
 }
 
+/*
+ * This function means to return 'true' for all supported insns with explicit
+ * writes to memory.  This means also insns which don't have an explicit
+ * memory operand (like PUSH), but it does not mean e.g. segment selector
+ * loads, where the (possible) descriptor table write is considered an
+ * implicit access.
+ */
 bool
 x86_insn_is_mem_write(const struct x86_emulate_state *state,
                       const struct x86_emulate_ctxt *ctxt)
 {
+    if ( mode_64bit() && state->not_64bit )
+        return false;
+
     switch ( state->desc & DstMask )
     {
     case DstMem:
@@ -11478,19 +12341,53 @@ x86_insn_is_mem_write(const struct x86_emulate_state *state,
         break;
 
     default:
+        switch ( ctxt->opcode )
+        {
+        case 0x63:                         /* ARPL */
+            return !mode_64bit();
+
+        case X86EMUL_OPC_66(0x0f38, 0xf8): /* MOVDIR64B */
+        case X86EMUL_OPC_F2(0x0f38, 0xf8): /* ENQCMD */
+        case X86EMUL_OPC_F3(0x0f38, 0xf8): /* ENQCMDS */
+            return true;
+        }
+
         return false;
     }
 
     if ( state->modrm_mod == 3 )
-        /* CLZERO is the odd one. */
-        return ctxt->opcode == X86EMUL_OPC(0x0f, 0x01) &&
-               (state->modrm_rm & 7) == 4 && (state->modrm_reg & 7) == 7;
+    {
+        switch ( ctxt->opcode )
+        {
+        case 0xff: /* Grp5 */
+            break;
+
+        case X86EMUL_OPC(0x0f, 0x01): /* CLZERO is the odd one. */
+            return (state->modrm_rm & 7) == 4 && (state->modrm_reg & 7) == 7;
+
+        default:
+            return false;
+        }
+    }
 
     switch ( ctxt->opcode )
     {
+    case 0x06:                           /* PUSH %es */
+    case 0x0e:                           /* PUSH %cs */
+    case 0x16:                           /* PUSH %ss */
+    case 0x1e:                           /* PUSH %ds */
+    case 0x50 ... 0x57:                  /* PUSH reg */
+    case 0x60:                           /* PUSHA */
+    case 0x68: case 0x6a:                /* PUSH imm */
     case 0x6c: case 0x6d:                /* INS */
+    case 0x9a:                           /* CALL (far, direct) */
+    case 0x9c:                           /* PUSHF */
     case 0xa4: case 0xa5:                /* MOVS */
     case 0xaa: case 0xab:                /* STOS */
+    case 0xc8:                           /* ENTER */
+    case 0xe8:                           /* CALL (near, direct) */
+    case X86EMUL_OPC(0x0f, 0xa0):        /* PUSH %fs */
+    case X86EMUL_OPC(0x0f, 0xa8):        /* PUSH %gs */
     case X86EMUL_OPC(0x0f, 0xab):        /* BTS */
     case X86EMUL_OPC(0x0f, 0xb3):        /* BTR */
     case X86EMUL_OPC(0x0f, 0xbb):        /* BTC */
@@ -11548,14 +12445,49 @@ x86_insn_is_mem_write(const struct x86_emulate_state *state,
         }
         break;
 
+    case 0xff:
+        switch ( state->modrm_reg & 7 )
+        {
+        case 2: /* CALL (near, indirect) */
+        case 3: /* CALL (far, indirect) */
+        case 6: /* PUSH r/m */
+            return true;
+        }
+        break;
+
     case X86EMUL_OPC(0x0f, 0x01):
-        return !(state->modrm_reg & 6); /* SGDT / SIDT */
+        switch ( state->modrm_reg & 7 )
+        {
+        case 0: /* SGDT */
+        case 1: /* SIDT */
+        case 4: /* SMSW */
+            return true;
+        }
+        break;
+
+    case X86EMUL_OPC(0x0f, 0xae):
+        switch ( state->modrm_reg & 7 )
+        {
+        case 0: /* FXSAVE */
+        /* case 3: STMXCSR - handled above */
+        case 4: /* XSAVE */
+        case 6: /* XSAVEOPT */
+            return true;
+        }
+        break;
 
     case X86EMUL_OPC(0x0f, 0xba):
         return (state->modrm_reg & 7) > 4; /* BTS / BTR / BTC */
 
     case X86EMUL_OPC(0x0f, 0xc7):
-        return (state->modrm_reg & 7) == 1; /* CMPXCHG{8,16}B */
+        switch ( state->modrm_reg & 7 )
+        {
+        case 1: /* CMPXCHG{8,16}B */
+        case 4: /* XSAVEC */
+        case 5: /* XSAVES */
+            return true;
+        }
+        break;
     }
 
     return false;
@@ -11623,5 +12555,3 @@ x86_insn_length(const struct x86_emulate_state *state,
 
     return state->ip - ctxt->regs->r(ip);
 }
-
-#endif

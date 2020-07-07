@@ -59,6 +59,9 @@
     (type *)((char *)mptr__ - offsetof(type, member)); \
 })
 
+#define AC_(n,t) (n##t)
+#define _AC(n,t) AC_(n,t)
+
 #define hweight32 __builtin_popcount
 #define hweight64 __builtin_popcountll
 
@@ -101,6 +104,12 @@ WRAP(puts);
 
 void evex_disp8_test(void *instr, struct x86_emulate_ctxt *ctxt,
                      const struct x86_emulate_ops *ops);
+void predicates_test(void *instr, struct x86_emulate_ctxt *ctxt,
+                     int (*fetch)(enum x86_segment seg,
+                                  unsigned long offset,
+                                  void *p_data,
+                                  unsigned int bytes,
+                                  struct x86_emulate_ctxt *ctxt));
 
 static inline uint64_t xgetbv(uint32_t xcr)
 {
@@ -120,6 +129,7 @@ static inline bool xcr0_mask(uint64_t mask)
 }
 
 #define cache_line_size() (cp.basic.clflush_size * 8)
+#define cpu_has_fpu        cp.basic.fpu
 #define cpu_has_mmx        cp.basic.mmx
 #define cpu_has_fxsr       cp.basic.fxsr
 #define cpu_has_sse        cp.basic.sse
@@ -154,8 +164,11 @@ static inline bool xcr0_mask(uint64_t mask)
 #define cpu_has_avx512_vnni (cp.feat.avx512_vnni && xcr0_mask(0xe6))
 #define cpu_has_avx512_bitalg (cp.feat.avx512_bitalg && xcr0_mask(0xe6))
 #define cpu_has_avx512_vpopcntdq (cp.feat.avx512_vpopcntdq && xcr0_mask(0xe6))
+#define cpu_has_movdiri    cp.feat.movdiri
+#define cpu_has_movdir64b  cp.feat.movdir64b
 #define cpu_has_avx512_4vnniw (cp.feat.avx512_4vnniw && xcr0_mask(0xe6))
 #define cpu_has_avx512_4fmaps (cp.feat.avx512_4fmaps && xcr0_mask(0xe6))
+#define cpu_has_serialize  cp.feat.serialize
 #define cpu_has_avx512_bf16 (cp.feat.avx512_bf16 && xcr0_mask(0xe6))
 
 #define cpu_has_xgetbv1   (cpu_has_xsave && cp.xstate.xgetbv1)

@@ -181,6 +181,12 @@ static int x86_hvm_process_record(struct xc_sr_context *ctx,
     case REC_TYPE_HVM_PARAMS:
         return handle_hvm_params(ctx, rec);
 
+    case REC_TYPE_X86_CPUID_POLICY:
+        return handle_x86_cpuid_policy(ctx, rec);
+
+    case REC_TYPE_X86_MSR_POLICY:
+        return handle_x86_msr_policy(ctx, rec);
+
     default:
         return RECORD_NOT_PROCESSED;
     }
@@ -237,6 +243,9 @@ static int x86_hvm_cleanup(struct xc_sr_context *ctx)
 {
     free(ctx->x86.hvm.restore.context.ptr);
 
+    free(ctx->x86.restore.cpuid.ptr);
+    free(ctx->x86.restore.msr.ptr);
+
     return 0;
 }
 
@@ -249,6 +258,7 @@ struct xc_sr_restore_ops restore_ops_x86_hvm =
     .localise_page   = x86_hvm_localise_page,
     .setup           = x86_hvm_setup,
     .process_record  = x86_hvm_process_record,
+    .static_data_complete = x86_static_data_complete,
     .stream_complete = x86_hvm_stream_complete,
     .cleanup         = x86_hvm_cleanup,
 };

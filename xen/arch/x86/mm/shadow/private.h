@@ -66,7 +66,11 @@ extern int shadow_audit_enable;
 #define SHOPT_FAST_EMULATION      0x80  /* Fast write emulation */
 #define SHOPT_OUT_OF_SYNC        0x100  /* Allow guest writes to L1 PTs */
 
+#ifdef CONFIG_HVM
 #define SHADOW_OPTIMIZATIONS     0x1ff
+#else
+#define SHADOW_OPTIMIZATIONS     (0x1ff & ~SHOPT_FAST_EMULATION)
+#endif
 
 
 /******************************************************************************
@@ -359,6 +363,7 @@ void sh_install_xen_entries_in_l4(struct domain *, mfn_t gl4mfn, mfn_t sl4mfn);
 /* Update the shadows in response to a pagetable write from Xen */
 int sh_validate_guest_entry(struct vcpu *v, mfn_t gmfn, void *entry, u32 size);
 
+#ifdef CONFIG_HVM
 /* Remove all writeable mappings of a guest frame from the shadows.
  * Returns non-zero if we need to flush TLBs.
  * level and fault_addr desribe how we found this to be a pagetable;
@@ -366,6 +371,15 @@ int sh_validate_guest_entry(struct vcpu *v, mfn_t gmfn, void *entry, u32 size);
 extern int sh_remove_write_access(struct domain *d, mfn_t readonly_mfn,
                                   unsigned int level,
                                   unsigned long fault_addr);
+#else
+static inline int sh_remove_write_access(struct domain *d, mfn_t readonly_mfn,
+                                         unsigned int level,
+                                         unsigned long fault_addr)
+{
+    ASSERT(!shadow_mode_refcounts(d));
+    return 0;
+}
+#endif
 
 /* Functions that atomically write PT/P2M entries and update state */
 int shadow_write_p2m_entry(struct p2m_domain *p2m, unsigned long gfn,
@@ -395,9 +409,6 @@ int sh_unsync(struct vcpu *v, mfn_t gmfn);
 void sh_resync(struct domain *d, mfn_t gmfn);
 
 void oos_fixup_add(struct domain *d, mfn_t gmfn, mfn_t smfn, unsigned long off);
-
-int sh_remove_write_access_from_sl1p(struct domain *d, mfn_t gmfn,
-                                     mfn_t smfn, unsigned long offset);
 
 /* Pull all out-of-sync shadows back into sync.  If skip != 0, we try
  * to avoid resyncing where we think we can get away with it. */
@@ -709,26 +720,11 @@ struct sh_emulate_ctxt {
 #endif
 };
 
-#ifdef CONFIG_HVM
 const struct x86_emulate_ops *shadow_init_emulation(
     struct sh_emulate_ctxt *sh_ctxt, struct cpu_user_regs *regs,
     unsigned int pte_size);
 void shadow_continue_emulation(
     struct sh_emulate_ctxt *sh_ctxt, struct cpu_user_regs *regs);
-#else
-static inline const struct x86_emulate_ops *shadow_init_emulation(
-    struct sh_emulate_ctxt *sh_ctxt, struct cpu_user_regs *regs,
-    unsigned int pte_size)
-{
-    BUG();
-    return NULL;
-}
-static inline void shadow_continue_emulation(
-    struct sh_emulate_ctxt *sh_ctxt, struct cpu_user_regs *regs)
-{
-    BUG();
-}
-#endif
 
 /* Stop counting towards early unshadows, as we've seen a real page fault */
 static inline void sh_reset_early_unshadow(struct vcpu *v)

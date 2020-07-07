@@ -545,7 +545,7 @@ void write_ptbase(struct vcpu *v)
  * Should be called after CR3 is updated.
  *
  * Uses values found in vcpu->arch.(guest_table and guest_table_user), and
- * for HVM guests, arch.monitor_table and hvm's guest CR3.
+ * for HVM guests, arch.hvm.monitor_table and hvm's guest CR3.
  *
  * Update ref counts to shadow tables appropriately.
  */
@@ -1235,8 +1235,14 @@ void put_page_from_l1e(l1_pgentry_t l1e, struct domain *l1e_owner)
      *
      * (Note that the undestroyable active grants are not a security hole in
      * Xen. All active grants can safely be cleaned up when the domain dies.)
+     *
+     * NB: the preprocessor conditional is required in order to prevent clang's
+     * -Wtautological-constant-compare complaining about converting the result
+     * of a << into a bool is always true if it's evaluated directly in the if
+     * condition.
      */
-    if ( _PAGE_GNTTAB && (l1e_get_flags(l1e) & _PAGE_GNTTAB) &&
+#if _PAGE_GNTTAB
+    if ( (l1e_get_flags(l1e) & _PAGE_GNTTAB) &&
          !l1e_owner->is_shutting_down && !l1e_owner->is_dying )
     {
         gdprintk(XENLOG_WARNING,
@@ -1244,6 +1250,7 @@ void put_page_from_l1e(l1_pgentry_t l1e, struct domain *l1e_owner)
                  l1e_get_intpte(l1e));
         domain_crash(l1e_owner);
     }
+#endif
 
     /*
      * Remember we didn't take a type-count of foreign writable mappings
@@ -1251,40 +1258,9 @@ void put_page_from_l1e(l1_pgentry_t l1e, struct domain *l1e_owner)
      */
     if ( (l1e_get_flags(l1e) & _PAGE_RW) &&
          ((l1e_owner == pg_owner) || !paging_mode_external(pg_owner)) )
-    {
         put_page_and_type(page);
-    }
     else
-    {
-#ifdef CONFIG_PV_LDT_PAGING
-        /* We expect this is rare so we blow the entire shadow LDT. */
-        if ( unlikely(((page->u.inuse.type_info & PGT_type_mask) ==
-                       PGT_seg_desc_page)) &&
-             unlikely(((page->u.inuse.type_info & PGT_count_mask) != 0)) &&
-             (l1e_owner == pg_owner) )
-        {
-            struct vcpu *v;
-            cpumask_t *mask = this_cpu(scratch_cpumask);
-
-            cpumask_clear(mask);
-
-            for_each_vcpu ( pg_owner, v )
-            {
-                unsigned int cpu;
-
-                if ( !pv_destroy_ldt(v) )
-                    continue;
-                cpu = read_atomic(&v->dirty_cpu);
-                if ( is_vcpu_dirty_cpu(cpu) )
-                    __cpumask_set_cpu(cpu, mask);
-            }
-
-            if ( !cpumask_empty(mask) )
-                flush_tlb_mask(mask);
-        }
-#endif /* CONFIG_PV_LDT_PAGING */
         put_page(page);
-    }
 }
 
 #ifdef CONFIG_PV
@@ -1454,8 +1430,7 @@ static bool pae_xen_mappings_check(const struct domain *d,
 void init_xen_pae_l2_slots(l2_pgentry_t *l2t, const struct domain *d)
 {
     memcpy(&l2t[COMPAT_L2_PAGETABLE_FIRST_XEN_SLOT(d)],
-           &compat_idle_pg_table_l2[
-               l2_table_offset(HIRO_COMPAT_MPT_VIRT_START)],
+           compat_idle_pg_table_l2,
            COMPAT_L2_PAGETABLE_XEN_SLOTS(d) * sizeof(*l2t));
 }
 
@@ -1684,7 +1659,7 @@ static int promote_l3_table(struct page_info *page)
  * This function must write all ROOT_PAGETABLE_PV_XEN_SLOTS, to clobber any
  * values a guest may have left there from promote_l4_table().
  *
- * l4t and l4mfn are mandatory, but l4mfn doesn't need to be the mfn under
+ * l4t, l4mfn, and d are mandatory, but l4mfn doesn't need to be the mfn under
  * *l4t.  All other parameters are optional and will either fill or zero the
  * appropriate slots.  Pagetables not shared with guests will gain the
  * extended directmap.
@@ -1696,7 +1671,7 @@ void init_xen_l4_slots(l4_pgentry_t *l4t, mfn_t l4mfn,
      * PV vcpus need a shortened directmap.  HVM and Idle vcpus get the full
      * directmap.
      */
-    bool short_directmap = d && !paging_mode_external(d);
+    bool short_directmap = !paging_mode_external(d);
 
     /* Slot 256: RO M2P (if applicable). */
     l4t[l4_table_offset(RO_MPT_VIRT_START)] =
@@ -1717,10 +1692,9 @@ void init_xen_l4_slots(l4_pgentry_t *l4t, mfn_t l4mfn,
         mfn_eq(sl4mfn, INVALID_MFN) ? l4e_empty() :
         l4e_from_mfn(sl4mfn, __PAGE_HYPERVISOR_RW);
 
-    /* Slot 260: Per-domain mappings (if applicable). */
+    /* Slot 260: Per-domain mappings. */
     l4t[l4_table_offset(PERDOMAIN_VIRT_START)] =
-        d ? l4e_from_page(d->arch.perdomain_l3_pg, __PAGE_HYPERVISOR_RW)
-          : l4e_empty();
+        l4e_from_page(d->arch.perdomain_l3_pg, __PAGE_HYPERVISOR_RW);
 
     /* Slot 261-: text/data/bss, RW M2P, vmap, frametable, directmap. */
 #ifndef NDEBUG
@@ -2151,16 +2125,17 @@ static int mod_l1_entry(l1_pgentry_t *pl1e, l1_pgentry_t nl1e,
              paging_mode_translate(pg_dom) )
         {
             p2m_type_t p2mt;
+            gfn_t gfn = _gfn(l1e_get_pfn(nl1e));
             p2m_query_t q = l1e_get_flags(nl1e) & _PAGE_RW ?
                             P2M_ALLOC | P2M_UNSHARE : P2M_ALLOC;
 
-            page = get_page_from_gfn(pg_dom, l1e_get_pfn(nl1e), &p2mt, q);
+            page = get_page_from_gfn(pg_dom, gfn_x(gfn), &p2mt, q);
 
             if ( p2m_is_paged(p2mt) )
             {
                 if ( page )
                     put_page(page);
-                p2m_mem_paging_populate(pg_dom, l1e_get_pfn(nl1e));
+                p2m_mem_paging_populate(pg_dom, gfn);
                 return -ENOENT;
             }
 
@@ -2919,7 +2894,17 @@ static int _get_page_type(struct page_info *page, unsigned long type,
                       ((nx & PGT_type_mask) == PGT_writable_page)) )
                 {
                     perfc_incr(need_flush_tlb_flush);
-                    flush_tlb_mask(mask);
+                    /*
+                     * If page was a page table make sure the flush is
+                     * performed using an IPI in order to avoid changing the
+                     * type of a page table page under the feet of
+                     * spurious_page_fault().
+                     */
+                    flush_mask(mask,
+                               (x & PGT_type_mask) &&
+                               (x & PGT_type_mask) <= PGT_root_page_table
+                               ? FLUSH_TLB | FLUSH_FORCE_IPI
+                               : FLUSH_TLB);
                 }
 
                 /* We lose existing type and validity. */
@@ -3701,14 +3686,15 @@ long do_mmuext_op(
         case MMUEXT_SET_LDT:
         {
             unsigned int ents = op.arg2.nr_ents;
-            unsigned long ptr = ents ? op.arg1.linear_addr : 0;
+            unsigned long ptr = ents ? op.arg1.linear_addr
+                                     : (unsigned long)ZERO_BLOCK_PTR;
 
             if ( unlikely(currd != pg_owner) )
                 rc = -EPERM;
             else if ( paging_mode_external(currd) )
                 rc = -EINVAL;
-            else if ( ((ptr & (PAGE_SIZE - 1)) != 0) || !__addr_ok(ptr) ||
-                      (ents > 8192) )
+            else if ( (ents > 8192) ||
+                      (ents && ((ptr & (PAGE_SIZE - 1)) || !__addr_ok(ptr))) )
             {
                 gdprintk(XENLOG_WARNING,
                          "Bad args to SET_LDT: ptr=%lx, ents=%x\n", ptr, ents);
@@ -3982,7 +3968,7 @@ long do_mmu_update(
                     put_page(page);
                 if ( p2m_is_paged(p2mt) )
                 {
-                    p2m_mem_paging_populate(pt_owner, gmfn);
+                    p2m_mem_paging_populate(pt_owner, _gfn(gmfn));
                     rc = -ENOENT;
                 }
                 else
@@ -4473,20 +4459,16 @@ static int _handle_iomem_range(unsigned long s, unsigned long e,
 {
     if ( s > ctxt->s && !(s >> (paddr_bits - PAGE_SHIFT)) )
     {
-        e820entry_t ent;
-        XEN_GUEST_HANDLE_PARAM(e820entry_t) buffer_param;
-        XEN_GUEST_HANDLE(e820entry_t) buffer;
-
         if ( !guest_handle_is_null(ctxt->map.buffer) )
         {
+            e820entry_t ent;
+
             if ( ctxt->n + 1 >= ctxt->map.nr_entries )
                 return -EINVAL;
             ent.addr = (uint64_t)ctxt->s << PAGE_SHIFT;
             ent.size = (uint64_t)(s - ctxt->s) << PAGE_SHIFT;
             ent.type = E820_RESERVED;
-            buffer_param = guest_handle_cast(ctxt->map.buffer, e820entry_t);
-            buffer = guest_handle_from_param(buffer_param, e820entry_t);
-            if ( __copy_to_guest_offset(buffer, ctxt->n, &ent, 1) )
+            if ( __copy_to_guest_offset(ctxt->map.buffer, ctxt->n, &ent, 1) )
                 return -EFAULT;
         }
         ctxt->n++;
@@ -4747,8 +4729,7 @@ long arch_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
     case XENMEM_machine_memory_map:
     {
         struct memory_map_context ctxt;
-        XEN_GUEST_HANDLE(e820entry_t) buffer;
-        XEN_GUEST_HANDLE_PARAM(e820entry_t) buffer_param;
+        XEN_GUEST_HANDLE_PARAM(e820entry_t) buffer;
         unsigned int i;
         bool store;
 
@@ -4764,8 +4745,7 @@ long arch_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         if ( store && ctxt.map.nr_entries < e820.nr_map + 1 )
             return -EINVAL;
 
-        buffer_param = guest_handle_cast(ctxt.map.buffer, e820entry_t);
-        buffer = guest_handle_from_param(buffer_param, e820entry_t);
+        buffer = guest_handle_cast(ctxt.map.buffer, e820entry_t);
         if ( store && !guest_handle_okay(buffer, ctxt.map.nr_entries) )
             return -EFAULT;
 
@@ -5480,8 +5460,8 @@ int populate_pt_range(unsigned long virt, unsigned long nr_mfns)
  * mappings, but will shatter superpages if necessary, and will destroy
  * mappings if not passed _PAGE_PRESENT.
  *
- * The only flags considered are NX, RW and PRESENT.  All other input flags
- * are ignored.
+ * The only flags considered are NX, D, A, RW and PRESENT.  All other input
+ * flags are ignored.
  *
  * It is an error to call with present flags over an unpopulated range.
  */
@@ -5494,7 +5474,7 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
     unsigned long v = s;
 
     /* Set of valid PTE bits which may be altered. */
-#define FLAGS_MASK (_PAGE_NX|_PAGE_RW|_PAGE_PRESENT)
+#define FLAGS_MASK (_PAGE_NX|_PAGE_DIRTY|_PAGE_ACCESSED|_PAGE_RW|_PAGE_PRESENT)
     nf &= FLAGS_MASK;
 
     ASSERT(IS_ALIGNED(s, PAGE_SIZE));
@@ -6032,27 +6012,41 @@ void memguard_unguard_range(void *p, unsigned long l)
 
 #endif
 
+static void write_sss_token(unsigned long *ptr)
+{
+    /*
+     * A supervisor shadow stack token is its own linear address, with the
+     * busy bit (0) clear.
+     */
+    *ptr = (unsigned long)ptr;
+}
+
 void memguard_guard_stack(void *p)
 {
-    /* IST_MAX IST pages + at least 1 guard page + primary stack. */
-    BUILD_BUG_ON((IST_MAX + 1) * PAGE_SIZE + PRIMARY_STACK_SIZE > STACK_SIZE);
+    /* IST Shadow stacks.  4x 1k in stack page 0. */
+    if ( IS_ENABLED(CONFIG_XEN_SHSTK) )
+    {
+        write_sss_token(p + (IST_MCE * IST_SHSTK_SIZE) - 8);
+        write_sss_token(p + (IST_NMI * IST_SHSTK_SIZE) - 8);
+        write_sss_token(p + (IST_DB  * IST_SHSTK_SIZE) - 8);
+        write_sss_token(p + (IST_DF  * IST_SHSTK_SIZE) - 8);
+    }
+    map_pages_to_xen((unsigned long)p, virt_to_mfn(p), 1, PAGE_HYPERVISOR_SHSTK);
 
-    memguard_guard_range(p + IST_MAX * PAGE_SIZE,
-                         STACK_SIZE - PRIMARY_STACK_SIZE - IST_MAX * PAGE_SIZE);
+    /* Primary Shadow Stack.  1x 4k in stack page 5. */
+    p += PRIMARY_SHSTK_SLOT * PAGE_SIZE;
+    if ( IS_ENABLED(CONFIG_XEN_SHSTK) )
+        write_sss_token(p + PAGE_SIZE - 8);
+
+    map_pages_to_xen((unsigned long)p, virt_to_mfn(p), 1, PAGE_HYPERVISOR_SHSTK);
 }
 
 void memguard_unguard_stack(void *p)
 {
-    memguard_unguard_range(p + IST_MAX * PAGE_SIZE,
-                           STACK_SIZE - PRIMARY_STACK_SIZE - IST_MAX * PAGE_SIZE);
-}
+    map_pages_to_xen((unsigned long)p, virt_to_mfn(p), 1, PAGE_HYPERVISOR_RW);
 
-bool memguard_is_stack_guard_page(unsigned long addr)
-{
-    addr &= STACK_SIZE - 1;
-
-    return addr >= IST_MAX * PAGE_SIZE &&
-           addr < STACK_SIZE - PRIMARY_STACK_SIZE;
+    p += PRIMARY_SHSTK_SLOT * PAGE_SIZE;
+    map_pages_to_xen((unsigned long)p, virt_to_mfn(p), 1, PAGE_HYPERVISOR_RW);
 }
 
 void arch_dump_shared_mem_info(void)

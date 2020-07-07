@@ -1,5 +1,14 @@
 #!/bin/bash
 
+#
+# DOCKER_CMD should be either `docker` or `podman`.
+#
+# if using (rootless) podman, remember to set /etc/subuid
+# and /etc/subgid.
+#
+docker_cmd=${DOCKER_CMD:-"docker"}
+[ "$DOCKER_CMD" = "podman" ] && userns_podman="--userns=keep-id"
+
 einfo() {
     echo "$*" >&2
 }
@@ -22,14 +31,17 @@ case "_${CONTAINER}" in
     _fedora) CONTAINER="${BASE}/fedora:29";;
     _jessie) CONTAINER="${BASE}/debian:jessie" ;;
     _stretch|_) CONTAINER="${BASE}/debian:stretch" ;;
+    _unstable|_) CONTAINER="${BASE}/debian:unstable" ;;
     _trusty) CONTAINER="${BASE}/ubuntu:trusty" ;;
     _xenial) CONTAINER="${BASE}/ubuntu:xenial" ;;
+    _opensuse-leap|_leap) CONTAINER="${BASE}/suse:opensuse-leap" ;;
+    _opensuse-tumbleweed|_tumbleweed) CONTAINER="${BASE}/suse:opensuse-tumbleweed" ;;
 esac
 
 # Use this variable to control whether root should be used
 case "_${CONTAINER_UID0}" in
     _1)   userarg= ;;
-    _0|_) userarg="-u $(id -u)" ;;
+    _0|_) userarg="-u $(id -u) $userns_podman" ;;
 esac
 
 # Save the commands for future use
@@ -47,8 +59,8 @@ tty -s && termint=t
 #
 if [[ "_${CONTAINER_NO_PULL}" != "_1" ]]; then
     einfo "*** Ensuring ${CONTAINER} is up to date"
-    docker pull ${CONTAINER} > /dev/null ||     \
-        die "Failed to update docker container"
+    ${docker_cmd} pull ${CONTAINER} > /dev/null ||     \
+        die "Failed to update container"
 fi
 
 if hash greadlink > /dev/null 2>&1; then
@@ -80,7 +92,7 @@ fi
 
 # Kick off Docker
 einfo "*** Launching container ..."
-exec docker run \
+exec ${docker_cmd} run \
     ${userarg} \
     ${SSH_AUTH_SOCK:+-e SSH_AUTH_SOCK="/tmp/ssh-agent/${SSH_AUTH_NAME}"} \
     -v "${CONTAINER_PATH}":/build:rw \
@@ -91,4 +103,3 @@ exec docker run \
     -${termint}i --rm -- \
     ${CONTAINER} \
     ${cmd}
-

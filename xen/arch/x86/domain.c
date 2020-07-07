@@ -183,7 +183,7 @@ void startup_cpu_idle_loop(void)
 
     ASSERT(is_idle_vcpu(v));
     cpumask_set_cpu(v->processor, v->domain->dirty_cpumask);
-    v->dirty_cpu = v->processor;
+    write_atomic(&v->dirty_cpu, v->processor);
 
     reset_stack_and_jump(idle_loop);
 }
@@ -840,6 +840,7 @@ int arch_set_info_guest(
 #ifdef CONFIG_PV
     mfn_t cr3_mfn;
     struct page_info *cr3_page = NULL;
+    unsigned int nr_gdt_frames;
     int rc = 0;
 #endif
 
@@ -932,12 +933,18 @@ int arch_set_info_guest(
         }
     }
 
+    if ( v->vcpu_id == 0 && (c(vm_assist) & ~arch_vm_assist_valid_mask(d)) )
+        return -EINVAL;
+
     if ( is_hvm_domain(d) )
     {
         for ( i = 0; i < ARRAY_SIZE(v->arch.dr); ++i )
             v->arch.dr[i] = c(debugreg[i]);
         v->arch.dr6 = c(debugreg[6]);
         v->arch.dr7 = c(debugreg[7]);
+
+        if ( v->vcpu_id == 0 )
+            d->vm_assist = c.nat->vm_assist;
 
         hvm_set_info_guest(v);
         goto out;
@@ -951,13 +958,19 @@ int arch_set_info_guest(
     /* Ensure real hardware interrupts are enabled. */
     v->arch.user_regs.eflags |= X86_EFLAGS_IF;
 
+    nr_gdt_frames = DIV_ROUND_UP(c(gdt_ents), 512);
+    if ( nr_gdt_frames > ARRAY_SIZE(v->arch.pv.gdt_frames) )
+        return -EINVAL;
+
     if ( !v->is_initialised )
     {
         if ( !compat && !(flags & VGCF_in_kernel) && !c.nat->ctrlreg[1] )
             return -EINVAL;
 
-        v->arch.pv.ldt_base = c(ldt_base);
         v->arch.pv.ldt_ents = c(ldt_ents);
+        v->arch.pv.ldt_base = v->arch.pv.ldt_ents
+                              ? c(ldt_base)
+                              : (unsigned long)ZERO_BLOCK_PTR;
     }
     else
     {
@@ -982,12 +995,13 @@ int arch_set_info_guest(
             fail = compat_pfn_to_cr3(pfn) != c.cmp->ctrlreg[3];
         }
 
-        for ( i = 0; i < ARRAY_SIZE(v->arch.pv.gdt_frames); ++i )
-            fail |= v->arch.pv.gdt_frames[i] != c(gdt_frames[i]);
         fail |= v->arch.pv.gdt_ents != c(gdt_ents);
+        for ( i = 0; !fail && i < nr_gdt_frames; ++i )
+            fail = v->arch.pv.gdt_frames[i] != c(gdt_frames[i]);
 
-        fail |= v->arch.pv.ldt_base != c(ldt_base);
         fail |= v->arch.pv.ldt_ents != c(ldt_ents);
+        if ( v->arch.pv.ldt_ents )
+            fail |= v->arch.pv.ldt_base != c(ldt_base);
 
         if ( fail )
            return -EOPNOTSUPP;
@@ -1085,19 +1099,15 @@ int arch_set_info_guest(
         return rc;
 
     if ( !compat )
-        rc = (int)pv_set_gdt(v, c.nat->gdt_frames, c.nat->gdt_ents);
+        rc = pv_set_gdt(v, c.nat->gdt_frames, c.nat->gdt_ents);
     else
     {
         unsigned long gdt_frames[ARRAY_SIZE(v->arch.pv.gdt_frames)];
-        unsigned int nr_frames = DIV_ROUND_UP(c.cmp->gdt_ents, 512);
 
-        if ( nr_frames > ARRAY_SIZE(v->arch.pv.gdt_frames) )
-            return -EINVAL;
-
-        for ( i = 0; i < nr_frames; ++i )
+        for ( i = 0; i < nr_gdt_frames; ++i )
             gdt_frames[i] = c.cmp->gdt_frames[i];
 
-        rc = (int)pv_set_gdt(v, gdt_frames, c.cmp->gdt_ents);
+        rc = pv_set_gdt(v, gdt_frames, c.cmp->gdt_ents);
     }
     if ( rc != 0 )
         return rc;
@@ -1763,6 +1773,7 @@ static void __context_switch(void)
 
     if ( !is_idle_domain(pd) )
     {
+        ASSERT(read_atomic(&p->dirty_cpu) == cpu);
         memcpy(&p->arch.user_regs, stack_regs, CTXT_SWITCH_STACK_BYTES);
         vcpu_save_fpu(p);
         pd->arch.ctxt_switch->from(p);
@@ -1826,7 +1837,7 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
 {
     unsigned int cpu = smp_processor_id();
     const struct domain *prevd = prev->domain, *nextd = next->domain;
-    unsigned int dirty_cpu = next->dirty_cpu;
+    unsigned int dirty_cpu = read_atomic(&next->dirty_cpu);
 
     ASSERT(prev != next);
     ASSERT(local_irq_is_enabled());
@@ -1838,6 +1849,7 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
     {
         /* Remote CPU calls __sync_local_execstate() from flush IPI handler. */
         flush_mask(cpumask_of(dirty_cpu), FLUSH_VCPU_STATE);
+        ASSERT(!vcpu_cpu_dirty(next));
     }
 
     _update_runstate_area(prev);
@@ -1950,13 +1962,17 @@ void sync_local_execstate(void)
 
 void sync_vcpu_execstate(struct vcpu *v)
 {
-    if ( v->dirty_cpu == smp_processor_id() )
+    unsigned int dirty_cpu = read_atomic(&v->dirty_cpu);
+
+    if ( dirty_cpu == smp_processor_id() )
         sync_local_execstate();
-    else if ( vcpu_cpu_dirty(v) )
+    else if ( is_vcpu_dirty_cpu(dirty_cpu) )
     {
         /* Remote CPU calls __sync_local_execstate() from flush IPI handler. */
-        flush_mask(cpumask_of(v->dirty_cpu), FLUSH_VCPU_STATE);
+        flush_mask(cpumask_of(dirty_cpu), FLUSH_VCPU_STATE);
     }
+    ASSERT(!is_vcpu_dirty_cpu(dirty_cpu) ||
+           read_atomic(&v->dirty_cpu) != dirty_cpu);
 }
 
 static int relinquish_memory(

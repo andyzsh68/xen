@@ -66,6 +66,8 @@
 #define STACK_ORDER 3
 #define STACK_SIZE  (PAGE_SIZE << STACK_ORDER)
 
+#define IST_SHSTK_SIZE 1024
+
 #define TRAMPOLINE_STACK_SPACE  PAGE_SIZE
 #define TRAMPOLINE_SPACE        (KB(64) - TRAMPOLINE_STACK_SPACE)
 #define WAKEUP_STACK_MIN        3072
@@ -74,6 +76,9 @@
 
 /* Primary stack is restricted to 8kB by guard pages. */
 #define PRIMARY_STACK_SIZE 8192
+
+/* Primary shadow stack is slot 5 of 8, immediately under the primary stack. */
+#define PRIMARY_SHSTK_SLOT 5
 
 /* Total size of syscall and emulation stubs. */
 #define STUB_BUF_SHIFT (L1_CACHE_SHIFT > 7 ? L1_CACHE_SHIFT : 7)
@@ -215,11 +220,8 @@ extern unsigned char boot_edid_info[128];
 /* Slot 261: compatibility machine-to-phys conversion table (1GB). */
 #define RDWR_COMPAT_MPT_VIRT_START VMAP_VIRT_END
 #define RDWR_COMPAT_MPT_VIRT_END (RDWR_COMPAT_MPT_VIRT_START + GB(1))
-/* Slot 261: high read-only compat machine-to-phys conversion table (1GB). */
-#define HIRO_COMPAT_MPT_VIRT_START RDWR_COMPAT_MPT_VIRT_END
-#define HIRO_COMPAT_MPT_VIRT_END (HIRO_COMPAT_MPT_VIRT_START + GB(1))
 /* Slot 261: xen text, static data, bss, per-cpu stubs and executable fixmap (1GB). */
-#define XEN_VIRT_START          (HIRO_COMPAT_MPT_VIRT_END)
+#define XEN_VIRT_START          RDWR_COMPAT_MPT_VIRT_END
 #define XEN_VIRT_END            (XEN_VIRT_START + GB(1))
 
 #ifndef CONFIG_BIGMEM
@@ -308,17 +310,6 @@ extern unsigned long xen_phys_start;
 #define ARG_XLAT_VA_SHIFT        (2 + PAGE_SHIFT)
 #define ARG_XLAT_START(v)        \
     (ARG_XLAT_VIRT_START + ((v)->vcpu_id << ARG_XLAT_VA_SHIFT))
-
-#define NATIVE_VM_ASSIST_VALID   ((1UL << VMASST_TYPE_4gb_segments)        | \
-                                  (1UL << VMASST_TYPE_4gb_segments_notify) | \
-                                  (1UL << VMASST_TYPE_writable_pagetables) | \
-                                  (1UL << VMASST_TYPE_pae_extended_cr3)    | \
-                                  (1UL << VMASST_TYPE_architectural_iopl)  | \
-                                  (1UL << VMASST_TYPE_runstate_update_flag)| \
-                                  (1UL << VMASST_TYPE_m2p_strict))
-#define VM_ASSIST_VALID          NATIVE_VM_ASSIST_VALID
-#define COMPAT_VM_ASSIST_VALID   (NATIVE_VM_ASSIST_VALID & \
-                                  ((1UL << COMPAT_BITS_PER_LONG) - 1))
 
 #define ELFSIZE 64
 

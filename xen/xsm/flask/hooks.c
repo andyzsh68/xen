@@ -29,6 +29,7 @@
 #include <public/platform.h>
 #include <public/version.h>
 #include <public/hvm/params.h>
+#include <public/xenoprof.h>
 #include <public/xsm/flask_op.h>
 
 #include <avc.h>
@@ -821,9 +822,6 @@ static int flask_sysctl(int cmd)
     case XEN_SYSCTL_coverage_op:
         return avc_current_has_perm(SECINITSID_XEN, SECCLASS_XEN2,
                                     XEN2__COVERAGE_OP, NULL);
-    case XEN_SYSCTL_set_parameter:
-        return avc_current_has_perm(SECINITSID_XEN, SECCLASS_XEN2,
-                                    XEN2__SET_PARAMETER, NULL);
 
     default:
         return avc_unknown_permission("sysctl", cmd);
@@ -1170,6 +1168,11 @@ static inline int flask_page_offline(uint32_t cmd)
     default:
         return avc_unknown_permission("page_offline", cmd);
     }
+}
+
+static inline int flask_hypfs_op(void)
+{
+    return domain_has_xen(current->domain, XEN__HYPFS_OP);
 }
 
 static int flask_add_to_physmap(struct domain *d1, struct domain *d2)
@@ -1811,6 +1814,7 @@ static struct xsm_operations flask_ops = {
     .resource_setup_misc = flask_resource_setup_misc,
 
     .page_offline = flask_page_offline,
+    .hypfs_op = flask_hypfs_op,
     .hvm_param = flask_hvm_param,
     .hvm_control = flask_hvm_param,
     .hvm_param_nested = flask_hvm_param_nested,

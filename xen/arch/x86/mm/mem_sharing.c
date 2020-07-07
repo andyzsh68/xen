@@ -633,31 +633,33 @@ unsigned int mem_sharing_get_nr_shared_mfns(void)
 /* Functions that change a page's type and ownership */
 static int page_make_sharable(struct domain *d,
                               struct page_info *page,
-                              int expected_refcnt)
+                              unsigned int expected_refcnt,
+                              bool validate_only)
 {
-    bool_t drop_dom_ref;
+    int rc = 0;
+    bool drop_dom_ref = false;
 
-    spin_lock(&d->page_alloc_lock);
+    spin_lock_recursive(&d->page_alloc_lock);
 
     if ( d->is_dying )
     {
-        spin_unlock(&d->page_alloc_lock);
-        return -EBUSY;
+        rc = -EBUSY;
+        goto out;
     }
 
     /* Change page type and count atomically */
     if ( !get_page_and_type(page, d, PGT_shared_page) )
     {
-        spin_unlock(&d->page_alloc_lock);
-        return -EINVAL;
+        rc = -EINVAL;
+        goto out;
     }
 
     /* Check it wasn't already sharable and undo if it was */
     if ( (page->u.inuse.type_info & PGT_count_mask) != 1 )
     {
-        spin_unlock(&d->page_alloc_lock);
         put_page_and_type(page);
-        return -EEXIST;
+        rc = -EEXIST;
+        goto out;
     }
 
     /*
@@ -666,20 +668,26 @@ static int page_make_sharable(struct domain *d,
      */
     if ( page->count_info != (PGC_allocated | (2 + expected_refcnt)) )
     {
-        spin_unlock(&d->page_alloc_lock);
         /* Return type count back to zero */
         put_page_and_type(page);
-        return -E2BIG;
+        rc = -E2BIG;
+        goto out;
     }
 
-    page_set_owner(page, dom_cow);
-    drop_dom_ref = !domain_adjust_tot_pages(d, -1);
-    page_list_del(page, &d->page_list);
-    spin_unlock(&d->page_alloc_lock);
+    if ( !validate_only )
+    {
+        page_set_owner(page, dom_cow);
+        drop_dom_ref = !domain_adjust_tot_pages(d, -1);
+        page_list_del(page, &d->page_list);
+    }
+
+out:
+    spin_unlock_recursive(&d->page_alloc_lock);
 
     if ( drop_dom_ref )
         put_domain(d);
-    return 0;
+
+    return rc;
 }
 
 static int page_make_private(struct domain *d, struct page_info *page)
@@ -810,7 +818,8 @@ static int debug_gref(struct domain *d, grant_ref_t ref)
 }
 
 static int nominate_page(struct domain *d, gfn_t gfn,
-                         int expected_refcnt, shr_handle_t *phandle)
+                         unsigned int expected_refcnt, bool validate_only,
+                         shr_handle_t *phandle)
 {
     struct p2m_domain *hp2m = p2m_get_hostp2m(d);
     p2m_type_t p2mt;
@@ -879,8 +888,8 @@ static int nominate_page(struct domain *d, gfn_t gfn,
     }
 
     /* Try to convert the mfn to the sharable type */
-    ret = page_make_sharable(d, page, expected_refcnt);
-    if ( ret )
+    ret = page_make_sharable(d, page, expected_refcnt, validate_only);
+    if ( ret || validate_only )
         goto out;
 
     /*
@@ -1392,13 +1401,13 @@ static int range_share(struct domain *d, struct domain *cd,
          * We only break out if we run out of memory as individual pages may
          * legitimately be unsharable and we just want to skip over those.
          */
-        rc = nominate_page(d, _gfn(start), 0, &sh);
+        rc = nominate_page(d, _gfn(start), 0, false, &sh);
         if ( rc == -ENOMEM )
             break;
 
         if ( !rc )
         {
-            rc = nominate_page(cd, _gfn(start), 0, &ch);
+            rc = nominate_page(cd, _gfn(start), 0, false, &ch);
             if ( rc == -ENOMEM )
                 break;
 
@@ -1430,17 +1439,19 @@ static int range_share(struct domain *d, struct domain *cd,
     return rc;
 }
 
-static inline int mem_sharing_control(struct domain *d, bool enable)
+static inline int mem_sharing_control(struct domain *d, bool enable,
+                                      uint16_t flags)
 {
     if ( enable )
     {
-        if ( unlikely(!is_hvm_domain(d)) )
+        if ( unlikely(!is_hvm_domain(d) || !cpu_has_vmx) )
             return -EOPNOTSUPP;
 
         if ( unlikely(!hap_enabled(d)) )
             return -ENODEV;
 
-        if ( unlikely(is_iommu_enabled(d)) )
+        if ( unlikely(is_iommu_enabled(d) &&
+                      !(flags & XENMEM_FORK_WITH_IOMMU_ALLOWED)) )
             return -EXDEV;
     }
 
@@ -1476,7 +1487,7 @@ int mem_sharing_fork_page(struct domain *d, gfn_t gfn, bool unsharing)
         /* For read-only accesses we just add a shared entry to the physmap */
         while ( parent )
         {
-            if ( !(rc = nominate_page(parent, gfn, 0, &handle)) )
+            if ( !(rc = nominate_page(parent, gfn, 0, false, &handle)) )
                 break;
 
             parent = parent->parent;
@@ -1645,6 +1656,7 @@ static void copy_tsc(struct domain *cd, struct domain *d)
 static int copy_special_pages(struct domain *cd, struct domain *d)
 {
     mfn_t new_mfn, old_mfn;
+    gfn_t new_gfn, old_gfn;
     struct p2m_domain *p2m = p2m_get_hostp2m(cd);
     static const unsigned int params[] =
     {
@@ -1689,6 +1701,30 @@ static int copy_special_pages(struct domain *cd, struct domain *d)
     old_mfn = _mfn(virt_to_mfn(d->shared_info));
     new_mfn = _mfn(virt_to_mfn(cd->shared_info));
     copy_domain_page(new_mfn, old_mfn);
+
+    old_gfn = _gfn(get_gpfn_from_mfn(mfn_x(old_mfn)));
+    new_gfn = _gfn(get_gpfn_from_mfn(mfn_x(new_mfn)));
+
+    if ( !gfn_eq(old_gfn, new_gfn) )
+    {
+        if ( !gfn_eq(new_gfn, INVALID_GFN) )
+        {
+            /* if shared_info is mapped to a different gfn just remove it */
+            rc = p2m->set_entry(p2m, new_gfn, INVALID_MFN, PAGE_ORDER_4K,
+                                p2m_invalid, p2m->default_access, -1);
+            if ( rc )
+                return rc;
+        }
+
+        if ( !gfn_eq(old_gfn, INVALID_GFN) )
+        {
+            /* now map it to the same gfn as the parent */
+            rc = p2m->set_entry(p2m, old_gfn, new_mfn, PAGE_ORDER_4K,
+                                p2m_ram_rw, p2m->default_access, -1);
+            if ( rc )
+                return rc;
+        }
+    }
 
     return 0;
 }
@@ -1773,20 +1809,22 @@ static int mem_sharing_fork_reset(struct domain *d, struct domain *pd)
     spin_lock_recursive(&d->page_alloc_lock);
     page_list_for_each_safe(page, tmp, &d->page_list)
     {
-        p2m_type_t p2mt;
-        p2m_access_t p2ma;
+        shr_handle_t sh;
         mfn_t mfn = page_to_mfn(page);
         gfn_t gfn = mfn_to_gfn(d, mfn);
 
-        mfn = __get_gfn_type_access(p2m, gfn_x(gfn), &p2mt, &p2ma,
-                                    0, NULL, false);
-
-        /* only reset pages that are sharable */
-        if ( !p2m_is_sharable(p2mt) )
-            continue;
-
-        /* take an extra reference or just skip if can't for whatever reason */
-        if ( !get_page(page, d) )
+        /*
+         * We only want to remove pages from the fork here that were copied
+         * from the parent but could be potentially re-populated using memory
+         * sharing after the reset. These pages all must be regular pages with
+         * no extra reference held to them, thus should be possible to make
+         * them sharable. Unfortunately p2m_is_sharable check is not sufficient
+         * to test this as it doesn't check the page's reference count. We thus
+         * check whether the page is convertable to the shared type using
+         * nominate_page. In case the page is already shared (ie. a share
+         * handle is returned) then we don't remove it.
+         */
+        if ( (rc = nominate_page(d, gfn, 0, true, &sh)) || sh )
             continue;
 
         /* forked memory is 4k, not splitting large pages so this must work */
@@ -1795,7 +1833,7 @@ static int mem_sharing_fork_reset(struct domain *d, struct domain *pd)
         ASSERT(!rc);
 
         put_page_alloc_ref(page);
-        put_page(page);
+        put_page_and_type(page);
     }
     spin_unlock_recursive(&d->page_alloc_lock);
 
@@ -1827,7 +1865,8 @@ int mem_sharing_memop(XEN_GUEST_HANDLE_PARAM(xen_mem_sharing_op_t) arg)
     if ( rc )
         goto out;
 
-    if ( !mem_sharing_enabled(d) && (rc = mem_sharing_control(d, true)) )
+    if ( !mem_sharing_enabled(d) &&
+         (rc = mem_sharing_control(d, true, 0)) )
         return rc;
 
     switch ( mso.op )
@@ -1836,7 +1875,7 @@ int mem_sharing_memop(XEN_GUEST_HANDLE_PARAM(xen_mem_sharing_op_t) arg)
     {
         shr_handle_t handle;
 
-        rc = nominate_page(d, _gfn(mso.u.nominate.u.gfn), 0, &handle);
+        rc = nominate_page(d, _gfn(mso.u.nominate.u.gfn), 0, false, &handle);
         mso.u.nominate.handle = handle;
     }
     break;
@@ -1851,7 +1890,7 @@ int mem_sharing_memop(XEN_GUEST_HANDLE_PARAM(xen_mem_sharing_op_t) arg)
         if ( rc < 0 )
             goto out;
 
-        rc = nominate_page(d, gfn, 3, &handle);
+        rc = nominate_page(d, gfn, 3, false, &handle);
         mso.u.nominate.handle = handle;
     }
     break;
@@ -2065,7 +2104,10 @@ int mem_sharing_memop(XEN_GUEST_HANDLE_PARAM(xen_mem_sharing_op_t) arg)
         struct domain *pd;
 
         rc = -EINVAL;
-        if ( mso.u.fork.pad[0] || mso.u.fork.pad[1] || mso.u.fork.pad[2] )
+        if ( mso.u.fork.pad )
+            goto out;
+        if ( mso.u.fork.flags &
+             ~(XENMEM_FORK_WITH_IOMMU_ALLOWED | XENMEM_FORK_BLOCK_INTERRUPTS) )
             goto out;
 
         rc = rcu_lock_live_remote_domain_by_id(mso.u.fork.parent_domain,
@@ -2080,7 +2122,8 @@ int mem_sharing_memop(XEN_GUEST_HANDLE_PARAM(xen_mem_sharing_op_t) arg)
             goto out;
         }
 
-        if ( !mem_sharing_enabled(pd) && (rc = mem_sharing_control(pd, true)) )
+        if ( !mem_sharing_enabled(pd) &&
+             (rc = mem_sharing_control(pd, true, mso.u.fork.flags)) )
         {
             rcu_unlock_domain(pd);
             goto out;
@@ -2092,6 +2135,9 @@ int mem_sharing_memop(XEN_GUEST_HANDLE_PARAM(xen_mem_sharing_op_t) arg)
             rc = hypercall_create_continuation(__HYPERVISOR_memory_op,
                                                "lh", XENMEM_sharing_op,
                                                arg);
+        else if ( !rc && (mso.u.fork.flags & XENMEM_FORK_BLOCK_INTERRUPTS) )
+            d->arch.hvm.mem_sharing.block_interrupts = true;
+
         rcu_unlock_domain(pd);
         break;
     }
@@ -2101,7 +2147,7 @@ int mem_sharing_memop(XEN_GUEST_HANDLE_PARAM(xen_mem_sharing_op_t) arg)
         struct domain *pd;
 
         rc = -EINVAL;
-        if ( mso.u.fork.pad[0] || mso.u.fork.pad[1] || mso.u.fork.pad[2] )
+        if ( mso.u.fork.pad || mso.u.fork.flags )
             goto out;
 
         rc = -ENOSYS;
@@ -2138,7 +2184,7 @@ int mem_sharing_domctl(struct domain *d, struct xen_domctl_mem_sharing_op *mec)
     switch ( mec->op )
     {
     case XEN_DOMCTL_MEM_SHARING_CONTROL:
-        rc = mem_sharing_control(d, mec->u.enable);
+        rc = mem_sharing_control(d, mec->u.enable, 0);
         break;
 
     default:

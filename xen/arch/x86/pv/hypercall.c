@@ -57,7 +57,7 @@ const hypercall_table_t pv_hypercall_table[] = {
 #ifdef CONFIG_GRANT_TABLE
     COMPAT_CALL(grant_table_op),
 #endif
-    COMPAT_CALL(vm_assist),
+    HYPERCALL(vm_assist),
     COMPAT_CALL(update_va_mapping_otherdomain),
     COMPAT_CALL(iret),
     COMPAT_CALL(vcpu_op),
@@ -84,6 +84,9 @@ const hypercall_table_t pv_hypercall_table[] = {
 #ifdef CONFIG_HVM
     HYPERCALL(hvm_op),
     COMPAT_CALL(dm_op),
+#endif
+#ifdef CONFIG_HYPFS
+    HYPERCALL(hypfs_op),
 #endif
     HYPERCALL(mca),
     HYPERCALL(arch_1),
@@ -302,6 +305,7 @@ void pv_ring3_init_hypercall_page(void *p)
     }
 }
 
+#ifdef CONFIG_PV32
 void pv_ring1_init_hypercall_page(void *p)
 {
     unsigned int i;
@@ -329,6 +333,7 @@ void pv_ring1_init_hypercall_page(void *p)
         *(u8  *)(p+ 7) = 0xc3;    /* ret */
     }
 }
+#endif
 
 /*
  * Local variables:

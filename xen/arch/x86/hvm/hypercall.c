@@ -22,6 +22,7 @@
 #include <xen/hypercall.h>
 #include <xen/nospec.h>
 
+#include <asm/hvm/emulate.h>
 #include <asm/hvm/support.h>
 #include <asm/hvm/viridian.h>
 
@@ -81,26 +82,26 @@ static long hvm_grant_table_op(
 static long hvm_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
 {
     const struct vcpu *curr = current;
+    const struct domain *currd = curr->domain;
 
     switch ( cmd )
     {
-    default:
-        if ( !is_hardware_domain(curr->domain) )
-            return -ENOSYS;
-        /* fall through */
     case PHYSDEVOP_map_pirq:
     case PHYSDEVOP_unmap_pirq:
     case PHYSDEVOP_eoi:
     case PHYSDEVOP_irq_status_query:
     case PHYSDEVOP_get_free_pirq:
-        if ( !has_pirq(curr->domain) )
+        if ( !has_pirq(currd) )
             return -ENOSYS;
         break;
 
     case PHYSDEVOP_pci_mmcfg_reserved:
-        if ( !has_vpci(curr->domain) )
+        if ( !has_vpci(currd) || !is_hardware_domain(currd) )
             return -ENOSYS;
         break;
+
+    default:
+        return -ENOSYS;
     }
 
     if ( !curr->hcall_compat )
@@ -128,6 +129,7 @@ static const hypercall_table_t hvm_hypercall_table[] = {
 #ifdef CONFIG_GRANT_TABLE
     HVM_CALL(grant_table_op),
 #endif
+    HYPERCALL(vm_assist),
     COMPAT_CALL(vcpu_op),
     HVM_CALL(physdev_op),
     COMPAT_CALL(xen_version),
@@ -148,6 +150,9 @@ static const hypercall_table_t hvm_hypercall_table[] = {
 #endif
     HYPERCALL(xenpmu_op),
     COMPAT_CALL(dm_op),
+#ifdef CONFIG_HYPFS
+    HYPERCALL(hypfs_op),
+#endif
     HYPERCALL(arch_1)
 };
 
@@ -163,6 +168,7 @@ int hvm_hypercall(struct cpu_user_regs *regs)
     struct domain *currd = curr->domain;
     int mode = hvm_guest_x86_mode(curr);
     unsigned long eax = regs->eax;
+    unsigned int token;
 
     switch ( mode )
     {
@@ -187,7 +193,18 @@ int hvm_hypercall(struct cpu_user_regs *regs)
     }
 
     if ( (eax & 0x80000000) && is_viridian_domain(currd) )
-        return viridian_hypercall(regs);
+    {
+        int ret;
+
+        /* See comment below. */
+        token = hvmemul_cache_disable(curr);
+
+        ret = viridian_hypercall(regs);
+
+        hvmemul_cache_restore(curr, token);
+
+        return ret;
+    }
 
     BUILD_BUG_ON(ARRAY_SIZE(hvm_hypercall_table) >
                  ARRAY_SIZE(hypercall_args_table));
@@ -205,6 +222,12 @@ int hvm_hypercall(struct cpu_user_regs *regs)
         regs->rax = -ENOSYS;
         return HVM_HCALL_completed;
     }
+
+    /*
+     * Caching is intended for instruction emulation only. Disable it
+     * for any accesses by hypercall argument copy-in / copy-out.
+     */
+    token = hvmemul_cache_disable(curr);
 
     curr->hcall_preempted = false;
 
@@ -298,6 +321,8 @@ int hvm_hypercall(struct cpu_user_regs *regs)
         }
 #endif
     }
+
+    hvmemul_cache_restore(curr, token);
 
     HVM_DBG_LOG(DBG_LEVEL_HCALL, "hcall%lu -> %lx", eax, regs->rax);
 

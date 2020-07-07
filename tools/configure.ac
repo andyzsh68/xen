@@ -73,6 +73,7 @@ m4_include([../m4/fetcher.m4])
 m4_include([../m4/ax_compare_version.m4])
 m4_include([../m4/paths.m4])
 m4_include([../m4/systemd.m4])
+m4_include([../m4/golang.m4])
 
 AX_XEN_EXPAND_CONFIG()
 
@@ -84,6 +85,7 @@ AX_ARG_DEFAULT_ENABLE([ocamltools], [Disable Ocaml tools])
 AX_ARG_DEFAULT_ENABLE([xsmpolicy], [Disable XSM policy compilation])
 AX_ARG_DEFAULT_DISABLE([ovmf], [Enable OVMF])
 AX_ARG_DEFAULT_ENABLE([seabios], [Disable SeaBIOS])
+AX_ARG_DEFAULT_ENABLE([golang], [Disable Go tools])
 
 AC_ARG_WITH([linux-backend-modules],
     AS_HELP_STRING([--with-linux-backend-modules="mod1 mod2"],
@@ -191,6 +193,15 @@ AC_DEFINE_UNQUOTED([QEMU_XEN_PATH], ["$qemu_xen_path"], [Qemu Xen path])
 AC_SUBST(qemu_xen)
 AC_SUBST(qemu_xen_path)
 AC_SUBST(qemu_xen_systemd)
+
+AC_ARG_WITH([stubdom-qmp-proxy],
+    AC_HELP_STRING([--stubdom-qmp-proxy@<:@=PATH@:>@],
+        [Use supplied binary PATH as a QMP proxy into stubdomain]),[
+    stubdom_qmp_proxy="$withval"
+],[
+    stubdom_qmp_proxy="$bindir/vchan-socket-proxy"
+])
+AC_DEFINE_UNQUOTED([STUBDOM_QMP_PROXY_PATH], ["$stubdom_qmp_proxy"], [QMP proxy path])
 
 AC_ARG_WITH([system-seabios],
     AS_HELP_STRING([--with-system-seabios@<:@=PATH@:>@],
@@ -316,6 +327,23 @@ AS_IF([test "x$ocamltools" = "xy"], [
             AS_IF([test "x$enable_ocamltools" = "xyes"], [
                 AC_MSG_ERROR([Your version of OCaml: $OCAMLVERSION is not supported])])
             ocamltools="n"
+        ])
+    ])
+])
+
+AS_IF([test "x$golang" = "xy"], [
+    AC_PROG_GO
+    AS_IF([test "x$GO" = "xno"], [
+        AS_IF([test "x$enable_golang" =  "xyes"], [
+            AC_MSG_ERROR([Go tools enabled, but missing go compiler])
+        ])
+        golang="n"
+    ], [
+        AX_COMPARE_VERSION([$GOVERSION], [lt], [1.11.1], [
+            AS_IF([test "x$enable_golang" = "xyes"], [
+                AC_MSG_ERROR(["Your version of go: $GOVERSION is not supported"])
+            ])
+            golang="n"
         ])
     ])
 ])

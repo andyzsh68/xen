@@ -195,7 +195,6 @@ static int enter_state(u32 state)
     unsigned long flags;
     int error;
     struct cpu_info *ci;
-    unsigned long cr4;
 
     if ( (state <= ACPI_STATE_S0) || (state > ACPI_S_STATES_MAX) )
         return -EINVAL;
@@ -270,15 +269,15 @@ static int enter_state(u32 state)
 
     system_state = SYS_STATE_resume;
 
-    /* Restore CR4 and EFER from cached values. */
-    cr4 = read_cr4();
-    write_cr4(cr4 & ~X86_CR4_MCE);
+    /* Restore EFER from cached value. */
     write_efer(read_efer());
 
     device_power_up(SAVED_ALL);
 
     mcheck_init(&boot_cpu_data, false);
-    write_cr4(cr4);
+
+    /* Restore CR4 from cached value, now MCE is set up. */
+    write_cr4(read_cr4());
 
     printk(XENLOG_INFO "Finishing wakeup from ACPI S%d state.\n", state);
 
@@ -288,7 +287,7 @@ static int enter_state(u32 state)
     console_end_sync();
     watchdog_enable();
 
-    microcode_update_one(true);
+    microcode_update_one();
 
     if ( !recheck_cpu_features(0) )
         panic("Missing previously available feature(s)\n");
@@ -296,6 +295,12 @@ static int enter_state(u32 state)
     /* Re-enabled default NMI/#MC use of MSR_SPEC_CTRL. */
     ci->spec_ctrl_flags |= (default_spec_ctrl_flags & SCF_ist_wrmsr);
     spec_ctrl_exit_idle(ci);
+
+    if ( boot_cpu_has(X86_FEATURE_SRBDS_CTRL) )
+        wrmsrl(MSR_MCU_OPT_CTRL, default_xen_mcu_opt_ctrl);
+
+    /* (re)initialise SYSCALL/SYSENTER state, amongst other things. */
+    percpu_traps_init();
 
  done:
     spin_debug_enable();

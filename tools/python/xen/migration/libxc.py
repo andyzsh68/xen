@@ -19,7 +19,6 @@ IHDR_FORMAT = "!QIIHHI"
 
 IHDR_MARKER  = 0xffffffffffffffff
 IHDR_IDENT   = 0x58454E46 # "XENF" in ASCII
-IHDR_VERSION = 2
 
 IHDR_OPT_BIT_ENDIAN = 0
 IHDR_OPT_LE = (0 << IHDR_OPT_BIT_ENDIAN)
@@ -57,6 +56,9 @@ REC_TYPE_x86_pv_vcpu_msrs           = 0x0000000c
 REC_TYPE_verify                     = 0x0000000d
 REC_TYPE_checkpoint                 = 0x0000000e
 REC_TYPE_checkpoint_dirty_pfn_list  = 0x0000000f
+REC_TYPE_static_data_end            = 0x00000010
+REC_TYPE_x86_cpuid_policy           = 0x00000011
+REC_TYPE_x86_msr_policy             = 0x00000012
 
 rec_type_to_str = {
     REC_TYPE_end                        : "End",
@@ -75,6 +77,9 @@ rec_type_to_str = {
     REC_TYPE_verify                     : "Verify",
     REC_TYPE_checkpoint                 : "Checkpoint",
     REC_TYPE_checkpoint_dirty_pfn_list  : "Checkpoint dirty pfn list",
+    REC_TYPE_static_data_end            : "Static data end",
+    REC_TYPE_x86_cpuid_policy           : "x86 CPUID policy",
+    REC_TYPE_x86_msr_policy             : "x86 MSR policy",
 }
 
 # page_data
@@ -112,12 +117,19 @@ X86_TSC_INFO_FORMAT       = "IIQII"
 HVM_PARAMS_ENTRY_FORMAT   = "QQ"
 HVM_PARAMS_FORMAT         = "II"
 
+# x86_cpuid_policy => xen_cpuid_leaf_t[]
+X86_CPUID_POLICY_FORMAT   = "IIIIII"
+
+# x86_msr_policy => xen_msr_entry_t[]
+X86_MSR_POLICY_FORMAT     = "QII"
+
 class VerifyLibxc(VerifyBase):
-    """ Verify a Libxc v2 stream """
+    """ Verify a Libxc v2 (or later) stream """
 
     def __init__(self, info, read):
         VerifyBase.__init__(self, info, read)
 
+        self.version = 0
         self.squashed_pagedata_records = 0
 
 
@@ -144,9 +156,12 @@ class VerifyLibxc(VerifyBase):
             raise StreamError("Bad image id: Expected 0x%x, got 0x%x" %
                               (IHDR_IDENT, ident))
 
-        if version != IHDR_VERSION:
-            raise StreamError("Unknown image version: Expected %d, got %d" %
-                              (IHDR_VERSION, version))
+        if not (2 <= version <= 3):
+            raise StreamError(
+                "Unknown image version: Expected 2 <= ver <= 3, got %d" %
+                (version, ))
+
+        self.version = version
 
         if options & IHDR_OPT_RESZ_MASK:
             raise StreamError("Reserved bits set in image options field: 0x%x" %
@@ -163,7 +178,8 @@ class VerifyLibxc(VerifyBase):
                 "Stream is not native endianess - unable to validate")
 
         endian = ["little", "big"][options & IHDR_OPT_LE]
-        self.info("Libxc Image Header: %s endian" % (endian, ))
+        self.info("Libxc Image Header: Version %d, %s endian" %
+                  (version, endian))
 
 
     def verify_dhdr(self):
@@ -423,6 +439,44 @@ class VerifyLibxc(VerifyBase):
         raise RecordError("Found checkpoint dirty pfn list record in stream")
 
 
+    def verify_record_static_data_end(self, content):
+        """ static data end record """
+
+        if len(content) != 0:
+            raise RecordError("End record with non-zero length")
+
+        if self.version < 3:
+            raise RecordError("Static data end record found in v2 stream")
+
+
+    def verify_record_x86_cpuid_policy(self, content):
+        """ x86 CPUID policy record """
+
+        if self.version < 3:
+            raise RecordError("x86 CPUID policy record found in v2 stream")
+
+        sz = calcsize(X86_CPUID_POLICY_FORMAT)
+        contentsz = len(content)
+
+        if contentsz < sz or (contentsz % sz) != 0:
+            raise RecordError("Record length %u, expected multiple of %u" %
+                              (contentsz, sz))
+
+
+    def verify_record_x86_msr_policy(self, content):
+        """ x86 MSR policy record """
+
+        if self.version < 3:
+            raise RecordError("x86 MSR policy record found in v2 stream")
+
+        sz = calcsize(X86_MSR_POLICY_FORMAT)
+        contentsz = len(content)
+
+        if contentsz < sz or (contentsz % sz) != 0:
+            raise RecordError("Record length %u, expected multiple of %u" %
+                              (contentsz, sz))
+
+
 record_verifiers = {
     REC_TYPE_end:
         VerifyLibxc.verify_record_end,
@@ -464,4 +518,12 @@ record_verifiers = {
         VerifyLibxc.verify_record_checkpoint,
     REC_TYPE_checkpoint_dirty_pfn_list:
         VerifyLibxc.verify_record_checkpoint_dirty_pfn_list,
+
+    REC_TYPE_static_data_end:
+        VerifyLibxc.verify_record_static_data_end,
+
+    REC_TYPE_x86_cpuid_policy:
+        VerifyLibxc.verify_record_x86_cpuid_policy,
+    REC_TYPE_x86_msr_policy:
+        VerifyLibxc.verify_record_x86_msr_policy,
     }

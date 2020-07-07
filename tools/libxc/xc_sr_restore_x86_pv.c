@@ -679,6 +679,23 @@ static int handle_x86_pv_p2m_frames(struct xc_sr_context *ctx,
     unsigned int start, end, x, fpp = PAGE_SIZE / ctx->x86.pv.width;
     int rc;
 
+    /* v2 compat.  Infer the position of STATIC_DATA_END. */
+    if ( ctx->restore.format_version < 3 && !ctx->restore.seen_static_data_end )
+    {
+        rc = handle_static_data_end(ctx);
+        if ( rc )
+        {
+            ERROR("Inferred STATIC_DATA_END record failed");
+            return rc;
+        }
+    }
+
+    if ( !ctx->restore.seen_static_data_end )
+    {
+        ERROR("No STATIC_DATA_END seen");
+        return -1;
+    }
+
     if ( !ctx->x86.pv.restore.seen_pv_info )
     {
         ERROR("Not yet received X86_PV_INFO record");
@@ -1085,6 +1102,12 @@ static int x86_pv_process_record(struct xc_sr_context *ctx,
     case REC_TYPE_X86_TSC_INFO:
         return handle_x86_tsc_info(ctx, rec);
 
+    case REC_TYPE_X86_CPUID_POLICY:
+        return handle_x86_cpuid_policy(ctx, rec);
+
+    case REC_TYPE_X86_MSR_POLICY:
+        return handle_x86_msr_policy(ctx, rec);
+
     default:
         return RECORD_NOT_PROCESSED;
     }
@@ -1156,6 +1179,9 @@ static int x86_pv_cleanup(struct xc_sr_context *ctx)
     if ( ctx->x86.pv.m2p )
         munmap(ctx->x86.pv.m2p, ctx->x86.pv.nr_m2p_frames * PAGE_SIZE);
 
+    free(ctx->x86.restore.cpuid.ptr);
+    free(ctx->x86.restore.msr.ptr);
+
     return 0;
 }
 
@@ -1168,6 +1194,7 @@ struct xc_sr_restore_ops restore_ops_x86_pv =
     .localise_page   = x86_pv_localise_page,
     .setup           = x86_pv_setup,
     .process_record  = x86_pv_process_record,
+    .static_data_complete = x86_static_data_complete,
     .stream_complete = x86_pv_stream_complete,
     .cleanup         = x86_pv_cleanup,
 };

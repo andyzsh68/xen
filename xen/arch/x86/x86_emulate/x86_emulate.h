@@ -310,6 +310,22 @@ struct x86_emulate_ops
         struct x86_emulate_ctxt *ctxt);
 
     /*
+     * blk: Emulate a large (block) memory access.
+     * @p_data: [IN/OUT] (optional) Pointer to source/destination buffer.
+     * @eflags: [IN/OUT] Pointer to EFLAGS to be updated according to
+     *                   instruction effects.
+     * @state:  [IN/OUT] Pointer to (opaque) emulator state.
+     */
+    int (*blk)(
+        enum x86_segment seg,
+        unsigned long offset,
+        void *p_data,
+        unsigned int bytes,
+        uint32_t *eflags,
+        struct x86_emulate_state *state,
+        struct x86_emulate_ctxt *ctxt);
+
+    /*
      * validate: Post-decode, pre-emulate hook to allow caller controlled
      * filtering.
      */
@@ -730,8 +746,6 @@ x86emul_unhandleable_rw(
     unsigned int bytes,
     struct x86_emulate_ctxt *ctxt);
 
-#ifdef __XEN__
-
 struct x86_emulate_state *
 x86_decode_insn(
     struct x86_emulate_ctxt *ctxt,
@@ -767,11 +781,13 @@ bool
 x86_insn_is_cr_access(const struct x86_emulate_state *state,
                       const struct x86_emulate_ctxt *ctxt);
 
-#ifdef NDEBUG
+#if !defined(__XEN__) || defined(NDEBUG)
 static inline void x86_emulate_free_state(struct x86_emulate_state *state) {}
 #else
 void x86_emulate_free_state(struct x86_emulate_state *state);
 #endif
+
+#ifdef __XEN__
 
 int x86emul_read_xcr(unsigned int reg, uint64_t *val,
                      struct x86_emulate_ctxt *ctxt);
@@ -790,6 +806,14 @@ int x86emul_cpuid(uint32_t leaf, uint32_t subleaf,
 int
 x86_emul_rmw(
     void *ptr,
+    unsigned int bytes,
+    uint32_t *eflags,
+    struct x86_emulate_state *state,
+    struct x86_emulate_ctxt *ctxt);
+int
+x86_emul_blk(
+    void *ptr,
+    void *data,
     unsigned int bytes,
     uint32_t *eflags,
     struct x86_emulate_state *state,

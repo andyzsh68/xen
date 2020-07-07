@@ -16,12 +16,61 @@
 #include <asm/pv/domain.h>
 #include <asm/shadow.h>
 
+#ifdef CONFIG_PV32
+int8_t __read_mostly opt_pv32 = -1;
+#endif
+
+static __init int parse_pv(const char *s)
+{
+    const char *ss;
+    int val, rc = 0;
+
+    do {
+        ss = strchr(s, ',');
+        if ( !ss )
+            ss = strchr(s, '\0');
+
+        if ( (val = parse_boolean("32", s, ss)) >= 0 )
+        {
+#ifdef CONFIG_PV32
+            opt_pv32 = val;
+#else
+            no_config_param("PV32", "pv", s, ss);
+#endif
+        }
+        else
+            rc = -EINVAL;
+
+        s = ss + 1;
+    } while ( *ss );
+
+    return rc;
+}
+custom_param("pv", parse_pv);
+
 static __read_mostly enum {
     PCID_OFF,
     PCID_ALL,
     PCID_XPTI,
     PCID_NOXPTI
 } opt_pcid = PCID_XPTI;
+
+#ifdef CONFIG_HYPFS
+static const char opt_pcid_2_string[][7] = {
+    [PCID_OFF] = "off",
+    [PCID_ALL] = "on",
+    [PCID_XPTI] = "xpti",
+    [PCID_NOXPTI] = "noxpti",
+};
+
+static void __init opt_pcid_init(struct param_hypfs *par)
+{
+    custom_runtime_set_var(par, opt_pcid_2_string[opt_pcid]);
+}
+#endif
+
+static int parse_pcid(const char *s);
+custom_runtime_param("pcid", parse_pcid, opt_pcid_init);
 
 static int parse_pcid(const char *s)
 {
@@ -55,9 +104,11 @@ static int parse_pcid(const char *s)
         break;
     }
 
+    custom_runtime_set_var(param_2_parfs(parse_pcid),
+                           opt_pcid_2_string[opt_pcid]);
+
     return rc;
 }
-custom_runtime_param("pcid", parse_pcid);
 
 static void noreturn continue_nonidle_domain(struct vcpu *v)
 {
@@ -174,13 +225,15 @@ int switch_compat(struct domain *d)
 
     BUILD_BUG_ON(offsetof(struct shared_info, vcpu_info) != 0);
 
+    if ( !opt_pv32 )
+        return -EOPNOTSUPP;
     if ( is_hvm_domain(d) || domain_tot_pages(d) != 0 )
         return -EACCES;
     if ( is_pv_32bit_domain(d) )
         return 0;
 
     d->arch.has_32bit_shinfo = 1;
-    d->arch.is_32bit_pv = 1;
+    d->arch.pv.is_32bit = true;
 
     for_each_vcpu( d, v )
     {
@@ -200,7 +253,7 @@ int switch_compat(struct domain *d)
     return 0;
 
  undo_and_fail:
-    d->arch.is_32bit_pv = d->arch.has_32bit_shinfo = 0;
+    d->arch.pv.is_32bit = d->arch.has_32bit_shinfo = false;
     for_each_vcpu( d, v )
     {
         free_compat_arg_xlat(v);
@@ -242,10 +295,6 @@ int pv_vcpu_initialise(struct vcpu *v)
     int rc;
 
     ASSERT(!is_idle_domain(d));
-
-#ifdef CONFIG_PV_LDT_PAGING
-    spin_lock_init(&v->arch.pv.shadow_ldt_lock);
-#endif
 
     rc = pv_create_gdt_ldt_l1tab(v);
     if ( rc )
@@ -322,9 +371,6 @@ int pv_domain_initialise(struct domain *d)
 
     d->arch.ctxt_switch = &pv_csw;
 
-    /* 64-bit PV guest by default. */
-    d->arch.is_32bit_pv = d->arch.has_32bit_shinfo = 0;
-
     d->arch.pv.xpti = is_hardware_domain(d) ? opt_xpti_hwdom : opt_xpti_domu;
 
     if ( !is_pv_32bit_domain(d) && use_invpcid && cpu_has_pcid )
@@ -366,18 +412,10 @@ bool __init xpti_pcid_enabled(void)
 
 static void _toggle_guest_pt(struct vcpu *v)
 {
-    const struct domain *d = v->domain;
-    struct cpu_info *cpu_info = get_cpu_info();
     unsigned long cr3;
 
     v->arch.flags ^= TF_kernel_mode;
     update_cr3(v);
-    if ( d->arch.pv.xpti )
-    {
-        cpu_info->root_pgt_changed = true;
-        cpu_info->pv_cr3 = __pa(this_cpu(root_pgt)) |
-                           (d->arch.pv.pcid ? get_pcid_bits(v, true) : 0);
-    }
 
     /*
      * Don't flush user global mappings from the TLB. Don't tick TLB clock.
@@ -385,15 +423,11 @@ static void _toggle_guest_pt(struct vcpu *v)
      * In shadow mode, though, update_cr3() may need to be accompanied by a
      * TLB flush (for just the incoming PCID), as the top level page table may
      * have changed behind our backs. To be on the safe side, suppress the
-     * no-flush unconditionally in this case. The XPTI CR3 write, if enabled,
-     * will then need to be a flushing one too.
+     * no-flush unconditionally in this case.
      */
     cr3 = v->arch.cr3;
-    if ( shadow_mode_enabled(d) )
-    {
+    if ( shadow_mode_enabled(v->domain) )
         cr3 &= ~X86_CR3_NOFLUSH;
-        cpu_info->pv_cr3 &= ~X86_CR3_NOFLUSH;
-    }
     write_cr3(cr3);
 
     if ( !(v->arch.flags & TF_kernel_mode) )
@@ -409,6 +443,8 @@ static void _toggle_guest_pt(struct vcpu *v)
 
 void toggle_guest_mode(struct vcpu *v)
 {
+    const struct domain *d = v->domain;
+
     ASSERT(!is_pv_32bit_vcpu(v));
 
     /* %fs/%gs bases can only be stale if WR{FS,GS}BASE are usable. */
@@ -422,8 +458,27 @@ void toggle_guest_mode(struct vcpu *v)
     asm volatile ( "swapgs" );
 
     _toggle_guest_pt(v);
+
+    if ( d->arch.pv.xpti )
+    {
+        struct cpu_info *cpu_info = get_cpu_info();
+
+        cpu_info->root_pgt_changed = true;
+        cpu_info->pv_cr3 = __pa(this_cpu(root_pgt)) |
+                           (d->arch.pv.pcid ? get_pcid_bits(v, true) : 0);
+        /*
+         * As in _toggle_guest_pt() the XPTI CR3 write needs to be a TLB-
+         * flushing one too for shadow mode guests.
+         */
+        if ( shadow_mode_enabled(d) )
+            cpu_info->pv_cr3 &= ~X86_CR3_NOFLUSH;
+    }
 }
 
+/*
+ * Must be called in matching pairs without returning to guest context
+ * inbetween.
+ */
 void toggle_guest_pt(struct vcpu *v)
 {
     if ( !is_pv_32bit_vcpu(v) )

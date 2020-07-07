@@ -478,6 +478,14 @@ u64 hvm_get_guest_tsc_fixed(struct vcpu *v, uint64_t at_tsc)
     return tsc + v->arch.hvm.cache_tsc_offset;
 }
 
+void hvm_set_info_guest(struct vcpu *v)
+{
+    if ( hvm_funcs.set_info_guest )
+        alternative_vcall(hvm_funcs.set_info_guest, v);
+
+    hvmemul_cancel(v);
+}
+
 void hvm_migrate_timers(struct vcpu *v)
 {
     rtc_migrate_timers(v);
@@ -719,6 +727,8 @@ int hvm_domain_initialise(struct domain *d)
 /* This function and all its descendants need to be to be idempotent. */
 void hvm_domain_relinquish_resources(struct domain *d)
 {
+    struct vcpu *v;
+
     if ( hvm_funcs.domain_relinquish_resources )
         alternative_vcall(hvm_funcs.domain_relinquish_resources, d);
 
@@ -735,6 +745,9 @@ void hvm_domain_relinquish_resources(struct domain *d)
     rtc_deinit(d);
     pmtimer_deinit(d);
     hpet_deinit(d);
+
+    for_each_vcpu ( d, v )
+        hvmemul_cache_destroy(v);
 }
 
 void hvm_domain_destroy(struct domain *d)
@@ -1033,6 +1046,13 @@ static int hvm_load_cpu_ctxt(struct domain *d, hvm_domain_context_t *h)
         return -EINVAL;
     }
 
+    if ( ctxt.cr3 >> d->arch.cpuid->extd.maxphysaddr )
+    {
+        printk(XENLOG_G_ERR "HVM%d restore: bad CR3 %#" PRIx64 "\n",
+               d->domain_id, ctxt.cr3);
+        return -EINVAL;
+    }
+
     if ( (ctxt.flags & ~XEN_X86_FPU_INITIALISED) != 0 )
     {
         gprintk(XENLOG_ERR, "bad flags value in CPU context: %#x\n",
@@ -1162,6 +1182,8 @@ static int hvm_load_cpu_ctxt(struct domain *d, hvm_domain_context_t *h)
     v->arch.dr[3] = ctxt.dr3;
     v->arch.dr6   = ctxt.dr6;
     v->arch.dr7   = ctxt.dr7;
+
+    hvmemul_cancel(v);
 
     /* Auxiliary processors should be woken immediately. */
     v->is_initialised = 1;
@@ -1540,6 +1562,10 @@ int hvm_vcpu_initialise(struct vcpu *v)
 
     v->arch.hvm.inject_event.vector = HVM_EVENT_VECTOR_UNSET;
 
+    rc = hvmemul_cache_init(v);
+    if ( rc )
+        goto fail4;
+
     rc = setup_compat_arg_xlat(v); /* teardown: free_compat_arg_xlat() */
     if ( rc != 0 )
         goto fail4;
@@ -1575,6 +1601,7 @@ int hvm_vcpu_initialise(struct vcpu *v)
  fail5:
     free_compat_arg_xlat(v);
  fail4:
+    hvmemul_cache_destroy(v);
     hvm_funcs.vcpu_destroy(v);
  fail3:
     vlapic_destroy(v);
@@ -1968,7 +1995,7 @@ int hvm_hap_nested_page_fault(paddr_t gpa, unsigned long gla,
      * locks in such circumstance.
      */
     if ( paged )
-        p2m_mem_paging_populate(currd, gfn);
+        p2m_mem_paging_populate(currd, _gfn(gfn));
 
     if ( sharing_enomem )
     {
@@ -2112,8 +2139,14 @@ int hvm_mov_to_cr(unsigned int cr, unsigned int gpr)
         break;
 
     case 3:
-        rc = hvm_set_cr3(val, true);
+    {
+        bool noflush = hvm_pcid_enabled(curr) && (val & X86_CR3_NOFLUSH);
+
+        if ( noflush )
+            val &= ~X86_CR3_NOFLUSH;
+        rc = hvm_set_cr3(val, noflush, true);
         break;
+    }
 
     case 4:
         rc = hvm_set_cr4(val, true);
@@ -2330,57 +2363,58 @@ int hvm_set_cr0(unsigned long value, bool may_defer)
     return X86EMUL_OKAY;
 }
 
-int hvm_set_cr3(unsigned long value, bool may_defer)
+int hvm_set_cr3(unsigned long value, bool noflush, bool may_defer)
 {
-    struct vcpu *v = current;
-    struct page_info *page;
-    unsigned long old = v->arch.hvm.guest_cr[3];
-    bool noflush = false;
+    struct vcpu *curr = current;
+    struct domain *currd = curr->domain;
 
-    if ( may_defer && unlikely(v->domain->arch.monitor.write_ctrlreg_enabled &
+    if ( value >> currd->arch.cpuid->extd.maxphysaddr )
+    {
+        HVM_DBG_LOG(DBG_LEVEL_1,
+                    "Attempt to set reserved CR3 bit(s): %lx", value);
+        return X86EMUL_EXCEPTION;
+    }
+
+    if ( may_defer && unlikely(currd->arch.monitor.write_ctrlreg_enabled &
                                monitor_ctrlreg_bitmask(VM_EVENT_X86_CR3)) )
     {
-        ASSERT(v->arch.vm_event);
+        ASSERT(curr->arch.vm_event);
 
-        if ( hvm_monitor_crX(CR3, value, old) )
+        if ( hvm_monitor_crX(CR3, value, curr->arch.hvm.guest_cr[3]) )
         {
             /* The actual write will occur in hvm_do_resume(), if permitted. */
-            v->arch.vm_event->write_data.do_write.cr3 = 1;
-            v->arch.vm_event->write_data.cr3 = value;
+            curr->arch.vm_event->write_data.do_write.cr3 = 1;
+            curr->arch.vm_event->write_data.cr3 = value;
+            curr->arch.vm_event->write_data.cr3_noflush = noflush;
 
             return X86EMUL_OKAY;
         }
     }
 
-    if ( hvm_pcid_enabled(v) ) /* Clear the noflush bit. */
-    {
-        noflush = value & X86_CR3_NOFLUSH;
-        value &= ~X86_CR3_NOFLUSH;
-    }
-
-    if ( hvm_paging_enabled(v) && !paging_mode_hap(v->domain) &&
-         ((value ^ v->arch.hvm.guest_cr[3]) >> PAGE_SHIFT) )
+    if ( hvm_paging_enabled(curr) && !paging_mode_hap(currd) &&
+         ((value ^ curr->arch.hvm.guest_cr[3]) >> PAGE_SHIFT) )
     {
         /* Shadow-mode CR3 change. Check PDBR and update refcounts. */
+        struct page_info *page;
+
         HVM_DBG_LOG(DBG_LEVEL_VMMU, "CR3 value = %lx", value);
-        page = get_page_from_gfn(v->domain, value >> PAGE_SHIFT,
-                                 NULL, P2M_ALLOC);
+        page = get_page_from_gfn(currd, value >> PAGE_SHIFT, NULL, P2M_ALLOC);
         if ( !page )
             goto bad_cr3;
 
-        put_page(pagetable_get_page(v->arch.guest_table));
-        v->arch.guest_table = pagetable_from_page(page);
+        put_page(pagetable_get_page(curr->arch.guest_table));
+        curr->arch.guest_table = pagetable_from_page(page);
 
         HVM_DBG_LOG(DBG_LEVEL_VMMU, "Update CR3 value = %lx", value);
     }
 
-    v->arch.hvm.guest_cr[3] = value;
-    paging_update_cr3(v, noflush);
+    curr->arch.hvm.guest_cr[3] = value;
+    paging_update_cr3(curr, noflush);
     return X86EMUL_OKAY;
 
  bad_cr3:
     gdprintk(XENLOG_ERR, "Invalid CR3\n");
-    domain_crash(v->domain);
+    domain_crash(currd);
     return X86EMUL_UNHANDLEABLE;
 }
 
@@ -2936,6 +2970,7 @@ void hvm_task_switch(
     unsigned int eflags, new_cpl;
     pagefault_info_t pfinfo;
     int exn_raised, rc;
+    unsigned int token = hvmemul_cache_disable(v);
     struct tss32 tss;
 
     hvm_get_segment_register(v, x86_seg_gdtr, &gdt);
@@ -3052,7 +3087,7 @@ void hvm_task_switch(
     if ( task_switch_load_seg(x86_seg_ldtr, tss.ldt, new_cpl, 0) )
         goto out;
 
-    rc = hvm_set_cr3(tss.cr3, true);
+    rc = hvm_set_cr3(tss.cr3, false, true);
     if ( rc == X86EMUL_EXCEPTION )
         hvm_inject_hw_exception(TRAP_gp_fault, 0);
     if ( rc != X86EMUL_OKAY )
@@ -3143,6 +3178,8 @@ void hvm_task_switch(
  out:
     hvm_unmap_entry(optss_desc);
     hvm_unmap_entry(nptss_desc);
+
+    hvmemul_cache_restore(v, token);
 }
 
 enum hvm_translation_result hvm_translate_get_page(
@@ -3199,7 +3236,7 @@ enum hvm_translation_result hvm_translate_get_page(
     if ( p2m_is_paging(p2mt) )
     {
         put_page(page);
-        p2m_mem_paging_populate(v->domain, gfn_x(gfn));
+        p2m_mem_paging_populate(v->domain, gfn);
         return HVMTRANS_gfn_paged_out;
     }
     if ( p2m_is_shared(p2mt) )
@@ -3230,7 +3267,6 @@ static enum hvm_translation_result __hvm_copy(
     void *buf, paddr_t addr, unsigned int size, struct vcpu *v, unsigned int flags,
     uint32_t pfec, pagefault_info_t *pfinfo)
 {
-    char *p;
     ASSERT(is_hvm_vcpu(v));
 
     /*
@@ -3278,11 +3314,17 @@ static enum hvm_translation_result __hvm_copy(
             return HVMTRANS_need_retry;
         }
 
-        p = __map_domain_page(page) + pgoff;
-
-        if ( flags & HVMCOPY_to_guest )
+        if ( (flags & HVMCOPY_to_guest) ||
+             !hvmemul_read_cache(v, gfn_to_gaddr(gfn) | pgoff, buf, count) )
         {
-            if ( p2m_is_discard_write(p2mt) )
+            void *p = __map_domain_page(page) + pgoff;
+
+            if ( !(flags & HVMCOPY_to_guest) )
+            {
+                memcpy(buf, p, count);
+                hvmemul_write_cache(v, gfn_to_gaddr(gfn) | pgoff, buf, count);
+            }
+            else if ( p2m_is_discard_write(p2mt) )
             {
                 static unsigned long lastpage;
 
@@ -3299,13 +3341,9 @@ static enum hvm_translation_result __hvm_copy(
                     memset(p, 0, count);
                 paging_mark_pfn_dirty(v->domain, _pfn(gfn_x(gfn)));
             }
-        }
-        else
-        {
-            memcpy(buf, p, count);
-        }
 
-        unmap_domain_page(p);
+            unmap_domain_page(p);
+        }
 
         addr += count;
         if ( buf )
@@ -3563,13 +3601,15 @@ int hvm_msr_write_intercept(unsigned int msr, uint64_t msr_content,
 
         ASSERT(v->arch.vm_event);
 
-        /* The actual write will occur in hvm_do_resume() (if permitted). */
-        v->arch.vm_event->write_data.do_write.msr = 1;
-        v->arch.vm_event->write_data.msr = msr;
-        v->arch.vm_event->write_data.value = msr_content;
+        if ( hvm_monitor_msr(msr, msr_content, msr_old_content) )
+        {
+            /* The actual write will occur in hvm_do_resume(), if permitted. */
+            v->arch.vm_event->write_data.do_write.msr = 1;
+            v->arch.vm_event->write_data.msr = msr;
+            v->arch.vm_event->write_data.value = msr_content;
 
-        hvm_monitor_msr(msr, msr_content, msr_old_content);
-        return X86EMUL_OKAY;
+            return X86EMUL_OKAY;
+        }
     }
 
     if ( (ret = guest_wrmsr(v, msr, msr_content)) != X86EMUL_UNHANDLEABLE )
@@ -5294,7 +5334,7 @@ int hvm_copy_context_and_params(struct domain *dst, struct domain *src)
         return -ENOMEM;
 
     if ( (rc = hvm_save(src, &c)) )
-        return rc;
+        goto out;
 
     for ( i = 0; i < HVM_NR_PARAMS; i++ )
     {
@@ -5304,11 +5344,13 @@ int hvm_copy_context_and_params(struct domain *dst, struct domain *src)
             continue;
 
         if ( (rc = hvm_set_param(dst, i, value)) )
-            return rc;
+            goto out;
     }
 
     c.cur = 0;
     rc = hvm_load(dst, &c);
+
+ out:
     vfree(c.data);
 
     return rc;

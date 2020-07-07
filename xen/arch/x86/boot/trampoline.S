@@ -91,6 +91,11 @@ trampoline_protmode_entry:
         and     %edi,%edx
         wrmsr
 1:
+        /* Set up PAT before enabling paging. */
+        mov     $XEN_MSR_PAT & 0xffffffff, %eax
+        mov     $XEN_MSR_PAT >> 32, %edx
+        mov     $MSR_IA32_CR_PAT, %ecx
+        wrmsr
 
         /* Set up EFER (Extended Feature Enable Register). */
         movl    $MSR_EFER,%ecx
@@ -140,9 +145,9 @@ gdt_48:
 GLOBAL(trampoline_misc_enable_off)
         .quad   0
 
-/* EFER OR-mask for boot paths.  This gets adjusted with NX when available. */
+/* EFER OR-mask for boot paths.  SCE conditional on PV support, NX added when available. */
 GLOBAL(trampoline_efer)
-        .long   EFER_LME | EFER_SCE
+        .long   EFER_LME | (EFER_SCE * IS_ENABLED(CONFIG_PV))
 
 GLOBAL(trampoline_xen_phys_start)
         .long   0

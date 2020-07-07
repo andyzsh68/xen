@@ -324,7 +324,7 @@ static int nsvm_vcpu_hostrestore(struct vcpu *v, struct cpu_user_regs *regs)
         v->arch.guest_table = pagetable_null();
         /* hvm_set_cr3() below sets v->arch.hvm.guest_cr[3] for us. */
     }
-    rc = hvm_set_cr3(n1vmcb->_cr3, true);
+    rc = hvm_set_cr3(n1vmcb->_cr3, false, true);
     if ( rc == X86EMUL_EXCEPTION )
         hvm_inject_hw_exception(TRAP_gp_fault, 0);
     if (rc != X86EMUL_OKAY)
@@ -343,7 +343,7 @@ static int nsvm_vcpu_hostrestore(struct vcpu *v, struct cpu_user_regs *regs)
     n1vmcb->exit_int_info.raw = 0;
 
     /* Cleanbits */
-    n1vmcb->cleanbits.bytes = 0;
+    n1vmcb->cleanbits.raw = 0;
 
     return 0;
 }
@@ -423,7 +423,7 @@ static int nsvm_vmcb_prepare4vmrun(struct vcpu *v, struct cpu_user_regs *regs)
     struct nestedvcpu *nv = &vcpu_nestedhvm(v);
     struct nestedsvm *svm = &vcpu_nestedsvm(v);
     struct vmcb_struct *ns_vmcb, *n1vmcb, *n2vmcb;
-    bool_t vcleanbits_valid;
+    vmcbcleanbits_t clean = {};
     int rc;
     uint64_t cr0;
 
@@ -435,17 +435,13 @@ static int nsvm_vmcb_prepare4vmrun(struct vcpu *v, struct cpu_user_regs *regs)
     ASSERT(n2vmcb != NULL);
 
     /* Check if virtual VMCB cleanbits are valid */
-    vcleanbits_valid = 1;
-    if ( svm->ns_ovvmcb_pa == INVALID_PADDR )
-        vcleanbits_valid = 0;
-    if (svm->ns_ovvmcb_pa != nv->nv_vvmcxaddr)
-        vcleanbits_valid = 0;
-
-#define vcleanbit_set(_name)	\
-    (vcleanbits_valid && ns_vmcb->cleanbits.fields._name)
+    if ( svm->ns_ovvmcb_pa != INVALID_PADDR &&
+         svm->ns_ovvmcb_pa == nv->nv_vvmcxaddr )
+        clean = ns_vmcb->cleanbits;
 
     /* Enable l2 guest intercepts */
-    if (!vcleanbit_set(intercepts)) {
+    if ( !clean.intercepts )
+    {
         svm->ns_cr_intercepts = ns_vmcb->_cr_intercepts;
         svm->ns_dr_intercepts = ns_vmcb->_dr_intercepts;
         svm->ns_exception_intercepts = ns_vmcb->_exception_intercepts;
@@ -492,7 +488,7 @@ static int nsvm_vmcb_prepare4vmrun(struct vcpu *v, struct cpu_user_regs *regs)
     n2vmcb->_tsc_offset = n1vmcb->_tsc_offset + ns_vmcb->_tsc_offset;
 
     /* Nested IO permission bitmaps */
-    rc = nsvm_vmrun_permissionmap(v, vcleanbit_set(iopm));
+    rc = nsvm_vmrun_permissionmap(v, clean.iopm);
     if (rc)
         return rc;
 
@@ -502,7 +498,8 @@ static int nsvm_vmcb_prepare4vmrun(struct vcpu *v, struct cpu_user_regs *regs)
     n2vmcb->tlb_control = ns_vmcb->tlb_control;
 
     /* Virtual Interrupts */
-    if (!vcleanbit_set(tpr)) {
+    if ( !clean.tpr )
+    {
         n2vmcb->_vintr = ns_vmcb->_vintr;
         n2vmcb->_vintr.fields.intr_masking = 1;
     }
@@ -520,9 +517,9 @@ static int nsvm_vmcb_prepare4vmrun(struct vcpu *v, struct cpu_user_regs *regs)
     n2vmcb->event_inj = ns_vmcb->event_inj;
 
     /* LBR and other virtualization */
-    if (!vcleanbit_set(lbr)) {
+    if ( !clean.lbr )
         svm->ns_virt_ext = ns_vmcb->virt_ext;
-    }
+
     n2vmcb->virt_ext.bytes =
         n1vmcb->virt_ext.bytes | ns_vmcb->virt_ext.bytes;
 
@@ -533,7 +530,8 @@ static int nsvm_vmcb_prepare4vmrun(struct vcpu *v, struct cpu_user_regs *regs)
      */
 
     /* Segments */
-    if (!vcleanbit_set(seg)) {
+    if ( !clean.seg )
+    {
         n2vmcb->es = ns_vmcb->es;
         n2vmcb->cs = ns_vmcb->cs;
         n2vmcb->ss = ns_vmcb->ss;
@@ -541,7 +539,8 @@ static int nsvm_vmcb_prepare4vmrun(struct vcpu *v, struct cpu_user_regs *regs)
         /* CPL */
         n2vmcb->_cpl = ns_vmcb->_cpl;
     }
-    if (!vcleanbit_set(dt)) {
+    if ( !clean.dt )
+    {
         n2vmcb->gdtr = ns_vmcb->gdtr;
         n2vmcb->idtr = ns_vmcb->idtr;
     }
@@ -584,7 +583,7 @@ static int nsvm_vmcb_prepare4vmrun(struct vcpu *v, struct cpu_user_regs *regs)
         nestedsvm_vmcb_set_nestedp2m(v, ns_vmcb, n2vmcb);
 
         /* hvm_set_cr3() below sets v->arch.hvm.guest_cr[3] for us. */
-        rc = hvm_set_cr3(ns_vmcb->_cr3, true);
+        rc = hvm_set_cr3(ns_vmcb->_cr3, false, true);
         if ( rc == X86EMUL_EXCEPTION )
             hvm_inject_hw_exception(TRAP_gp_fault, 0);
         if (rc != X86EMUL_OKAY)
@@ -598,7 +597,7 @@ static int nsvm_vmcb_prepare4vmrun(struct vcpu *v, struct cpu_user_regs *regs)
          * we assume it intercepts page faults.
          */
         /* hvm_set_cr3() below sets v->arch.hvm.guest_cr[3] for us. */
-        rc = hvm_set_cr3(ns_vmcb->_cr3, true);
+        rc = hvm_set_cr3(ns_vmcb->_cr3, false, true);
         if ( rc == X86EMUL_EXCEPTION )
             hvm_inject_hw_exception(TRAP_gp_fault, 0);
         if (rc != X86EMUL_OKAY)
@@ -614,7 +613,8 @@ static int nsvm_vmcb_prepare4vmrun(struct vcpu *v, struct cpu_user_regs *regs)
     }
 
     /* DRn */
-    if (!vcleanbit_set(dr)) {
+    if ( !clean.dr )
+    {
         n2vmcb->_dr7 = ns_vmcb->_dr7;
         n2vmcb->_dr6 = ns_vmcb->_dr6;
     }
@@ -637,11 +637,11 @@ static int nsvm_vmcb_prepare4vmrun(struct vcpu *v, struct cpu_user_regs *regs)
      */
 
     /* PAT */
-    if (!vcleanbit_set(np)) {
+    if ( !clean.np )
         n2vmcb->_g_pat = ns_vmcb->_g_pat;
-    }
 
-    if (!vcleanbit_set(lbr)) {
+    if ( !clean.lbr )
+    {
         /* Debug Control MSR */
         n2vmcb->_debugctlmsr = ns_vmcb->_debugctlmsr;
 
@@ -653,7 +653,7 @@ static int nsvm_vmcb_prepare4vmrun(struct vcpu *v, struct cpu_user_regs *regs)
     }
 
     /* Cleanbits */
-    n2vmcb->cleanbits.bytes = 0;
+    n2vmcb->cleanbits.raw = 0;
 
     rc = svm_vmcb_isvalid(__func__, ns_vmcb, v, true);
     if (rc) {
@@ -673,7 +673,6 @@ static int nsvm_vmcb_prepare4vmrun(struct vcpu *v, struct cpu_user_regs *regs)
     regs->rsp = ns_vmcb->rsp;
     regs->rflags = ns_vmcb->rflags;
 
-#undef vcleanbit_set
     return 0;
 }
 

@@ -10,6 +10,7 @@
  */
 
 #include <xen/domain_page.h>
+#include <xen/err.h>
 #include <xen/event.h>
 #include <asm/x86_emulate.h>
 #include <asm/processor.h> /* current_cpu_info */
@@ -41,6 +42,14 @@
         (stb).ptr = NULL;                                  \
     }                                                      \
 })
+
+#define FXSAVE_AREA current->arch.fpu_ctxt
+
+#ifndef CONFIG_HVM
+# define X86EMUL_NO_FPU
+# define X86EMUL_NO_MMX
+# define X86EMUL_NO_SIMD
+#endif
 
 #include "x86_emulate/x86_emulate.c"
 

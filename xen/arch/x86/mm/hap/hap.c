@@ -59,7 +59,7 @@
 int hap_track_dirty_vram(struct domain *d,
                          unsigned long begin_pfn,
                          unsigned long nr,
-                         XEN_GUEST_HANDLE_PARAM(void) guest_dirty_bitmap)
+                         XEN_GUEST_HANDLE(void) guest_dirty_bitmap)
 {
     long rc = 0;
     struct sh_dirty_vram *dirty_vram;
@@ -118,7 +118,7 @@ int hap_track_dirty_vram(struct domain *d,
             p2m_change_type_range(d, begin_pfn, begin_pfn + nr,
                                   p2m_ram_rw, p2m_ram_logdirty);
 
-            flush_tlb_mask(d->dirty_cpumask);
+            guest_flush_tlb_mask(d, d->dirty_cpumask);
 
             memset(dirty_bitmap, 0xff, size); /* consider all pages dirty */
         }
@@ -205,7 +205,7 @@ static int hap_enable_log_dirty(struct domain *d, bool_t log_global)
          * to be read-only, or via hardware-assisted log-dirty.
          */
         p2m_change_entry_type_global(d, p2m_ram_rw, p2m_ram_logdirty);
-        flush_tlb_mask(d->dirty_cpumask);
+        guest_flush_tlb_mask(d, d->dirty_cpumask);
     }
     return 0;
 }
@@ -234,7 +234,7 @@ static void hap_clean_dirty_bitmap(struct domain *d)
      * be read-only, or via hardware-assisted log-dirty.
      */
     p2m_change_entry_type_global(d, p2m_ram_rw, p2m_ram_logdirty);
-    flush_tlb_mask(d->dirty_cpumask);
+    guest_flush_tlb_mask(d, d->dirty_cpumask);
 }
 
 /************************************************/
@@ -393,7 +393,7 @@ static mfn_t hap_make_monitor_table(struct vcpu *v)
     l4_pgentry_t *l4e;
     mfn_t m4mfn;
 
-    ASSERT(pagetable_get_pfn(v->arch.monitor_table) == 0);
+    ASSERT(pagetable_get_pfn(v->arch.hvm.monitor_table) == 0);
 
     if ( (pg = hap_alloc(d)) == NULL )
         goto oom;
@@ -579,10 +579,10 @@ void hap_teardown(struct domain *d, bool *preempted)
         {
             if ( paging_get_hostmode(v) && paging_mode_external(d) )
             {
-                mfn = pagetable_get_mfn(v->arch.monitor_table);
+                mfn = pagetable_get_mfn(v->arch.hvm.monitor_table);
                 if ( mfn_valid(mfn) && (mfn_x(mfn) != 0) )
                     hap_destroy_monitor_table(v, mfn);
-                v->arch.monitor_table = pagetable_null();
+                v->arch.hvm.monitor_table = pagetable_null();
             }
         }
     }
@@ -719,7 +719,7 @@ static bool flush_tlb(bool (*flush_vcpu)(void *ctxt, struct vcpu *v),
         hvm_asid_flush_vcpu(v);
 
         cpu = read_atomic(&v->dirty_cpu);
-        if ( cpu != this_cpu && is_vcpu_dirty_cpu(cpu) )
+        if ( cpu != this_cpu && is_vcpu_dirty_cpu(cpu) && v->is_running )
             __cpumask_set_cpu(cpu, mask);
     }
 
@@ -729,7 +729,7 @@ static bool flush_tlb(bool (*flush_vcpu)(void *ctxt, struct vcpu *v),
      * not currently running will already be flushed when scheduled because of
      * the ASID tickle done in the loop above.
      */
-    on_selected_cpus(mask, dummy_flush, mask, 0);
+    on_selected_cpus(mask, dummy_flush, NULL, 0);
 
     return true;
 }
@@ -758,10 +758,10 @@ static void hap_update_paging_modes(struct vcpu *v)
 
     v->arch.paging.mode = hap_paging_get_mode(v);
 
-    if ( pagetable_is_null(v->arch.monitor_table) )
+    if ( pagetable_is_null(v->arch.hvm.monitor_table) )
     {
         mfn_t mmfn = hap_make_monitor_table(v);
-        v->arch.monitor_table = pagetable_from_mfn(mmfn);
+        v->arch.hvm.monitor_table = pagetable_from_mfn(mmfn);
         make_cr3(v, mmfn);
         hvm_update_host_cr3(v);
     }
@@ -812,7 +812,7 @@ hap_write_p2m_entry(struct p2m_domain *p2m, unsigned long gfn, l1_pgentry_t *p,
 
     safe_write_pte(p, new);
     if ( old_flags & _PAGE_PRESENT )
-        flush_tlb_mask(d->dirty_cpumask);
+        guest_flush_tlb_mask(d, d->dirty_cpumask);
 
     paging_unlock(d);
 

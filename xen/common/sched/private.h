@@ -172,32 +172,12 @@ static inline void sched_set_pause_flags(struct sched_unit *unit,
     struct vcpu *v;
 
     for_each_sched_unit_vcpu ( unit, v )
-        __set_bit(bit, &v->pause_flags);
+        set_bit(bit, &v->pause_flags);
 }
 
 /* Clear a bit in pause_flags of all vcpus of a unit. */
 static inline void sched_clear_pause_flags(struct sched_unit *unit,
                                            unsigned int bit)
-{
-    struct vcpu *v;
-
-    for_each_sched_unit_vcpu ( unit, v )
-        __clear_bit(bit, &v->pause_flags);
-}
-
-/* Set a bit in pause_flags of all vcpus of a unit via atomic updates. */
-static inline void sched_set_pause_flags_atomic(struct sched_unit *unit,
-                                                unsigned int bit)
-{
-    struct vcpu *v;
-
-    for_each_sched_unit_vcpu ( unit, v )
-        set_bit(bit, &v->pause_flags);
-}
-
-/* Clear a bit in pause_flags of all vcpus of a unit via atomic updates. */
-static inline void sched_clear_pause_flags_atomic(struct sched_unit *unit,
-                                                  unsigned int bit)
 {
     struct vcpu *v;
 
@@ -295,6 +275,7 @@ struct scheduler {
     char *opt_name;         /* option name for this scheduler    */
     unsigned int sched_id;  /* ID for this scheduler             */
     void *sched_data;       /* global data pointer               */
+    struct cpupool *cpupool;/* points to this scheduler's pool   */
 
     int          (*global_init)    (void);
 

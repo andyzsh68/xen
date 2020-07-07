@@ -270,6 +270,27 @@ and not running softirqs. Reduce this if softirqs are not being run frequently
 enough. Setting this to a high value may cause boot failure, particularly if
 the NMI watchdog is also enabled.
 
+### cet
+    = List of [ shstk=<bool> ]
+
+    Applicability: x86
+
+Controls for the use of Control-flow Enforcement Technology.  CET is group a
+of hardware features designed to combat Return-oriented Programming (ROP, also
+call/jmp COP/JOP) attacks.
+
+*   The `shstk=` boolean controls whether Xen uses Shadow Stacks for its own
+    protection.
+
+    The option is available when `CONFIG_XEN_SHSTK` is compiled in, and
+    defaults to `true` on hardware supporting CET-SS.  Specifying
+    `cet=no-shstk` will cause Xen not to use Shadow Stacks even when support
+    is available in hardware.
+
+    Shadow Stacks are incompatible with 32bit PV guests.  This option will
+    override the `pv=32` boolean to false.  Backwards compatibility can be
+    maintained with the `pv-shim` mechanism.
+
 ### clocksource (x86)
 > `= pit | hpet | acpi | tsc`
 
@@ -481,12 +502,31 @@ choice of `dom0-kernel` is deprecated and not supported by all Dom0 kernels.
 This option allows for fine tuning of the facilities Xen will use, after
 accounting for hardware capabilities as enumerated via CPUID.
 
+Unless otherwise noted, options only have any effect in their negative form,
+to hide the named feature(s).  Ignoring a feature using this mechanism will
+cause Xen not to use the feature, nor offer them as usable to guests.
+
 Currently accepted:
 
-The Speculation Control hardware features `md-clear`, `ibrsb`, `stibp`, `ibpb`,
-`l1d-flush` and `ssbd` are used by default if available and applicable.  They can
-be ignored, e.g. `no-ibrsb`, at which point Xen won't use them itself, and
-won't offer them to guests.
+The Speculation Control hardware features `srbds-ctrl`, `md-clear`, `ibrsb`,
+`stibp`, `ibpb`, `l1d-flush` and `ssbd` are used by default if available and
+applicable.  They can all be ignored.
+
+`rdrand` and `rdseed` have multiple interactions.
+
+*   For Special Register Buffer Data Sampling (SRBDS, XSA-320, CVE-2020-0543),
+    RDRAND and RDSEED can be ignored.
+
+    Due to the absence of microcode to address SRBDS on IvyBridge client
+    hardware, the RDRAND feature is hidden by default for guests, unless
+    `rdrand` is used in its positive form.  Irrespective of the setting here,
+    VMs can use RDRAND if explicitly enabled in guest config file, and VMs
+    already using RDRAND can migrate in.
+
+*   The RDRAND feature is disabled by default on AMD Fam15/16 systems, due to
+    possible malfunctions after ACPI S3 suspend/resume.  `rdrand` may be used
+    in its positive form to override Xen's default behaviour on these systems,
+    and make the feature fully usable.
 
 ### cpuid_mask_cpu
 > `= fam_0f_rev_[cdefg] | fam_10_rev_[bc] | fam_11_rev_b`
@@ -1694,7 +1734,21 @@ The following resources are available:
     CDP, one COS will corespond two CBMs other than one with CAT, due to the
     sum of CBMs is fixed, that means actual `cos_max` in use will automatically
     reduce to half when CDP is enabled.
-	
+
+### pv
+    = List of [ 32=<bool> ]
+
+    Applicability: x86
+
+Controls for aspects of PV guest support.
+
+*   The `32` boolean controls whether 32bit PV guests can be created.  It
+    defaults to `true`, and is ignored when `CONFIG_PV32` is compiled out.
+
+    32bit PV guests are incompatible with CET Shadow Stacks.  If Xen is using
+    shadow stacks, this option will be overridden to `false`.  Backwards
+    compatibility can be maintained with the `pv-shim` mechanism.
+
 ### pv-linear-pt (x86)
 > `= <boolean>`
 
@@ -1825,6 +1879,20 @@ with read and write permissions.
 > Default: `sched=credit`
 
 Choose the default scheduler.
+
+### sched_credit2_max_cpus_runqueue
+> `= <integer>`
+
+> Default: `16`
+
+Defines how many CPUs will be put, at most, in each Credit2 runqueue.
+
+Runqueues are still arranged according to the host topology (and following
+what indicated by the 'credit2_runqueue' parameter). But we also have a cap
+to the number of CPUs that share each runqueues.
+
+A value that is a submultiple of the number of online CPUs is recommended,
+as that would likely produce a perfectly balanced runqueue configuration.
 
 ### sched_credit2_migrate_resist
 > `= <integer>`
@@ -1995,7 +2063,7 @@ By default SSBD will be mitigated at runtime (i.e `ssbd=runtime`).
 ### spec-ctrl (x86)
 > `= List of [ <bool>, xen=<bool>, {pv,hvm,msr-sc,rsb,md-clear}=<bool>,
 >              bti-thunk=retpoline|lfence|jmp, {ibrs,ibpb,ssbd,eager-fpu,
->              l1d-flush,branch-harden}=<bool> ]`
+>              l1d-flush,branch-harden,srb-lock}=<bool> ]`
 
 Controls for speculative execution sidechannel mitigations.  By default, Xen
 will pick the most appropriate mitigations based on compiled in support,
@@ -2071,6 +2139,12 @@ If Xen is compiled with `CONFIG_SPECULATIVE_HARDEN_BRANCH`, the
 `branch-harden=` boolean can be used to force or prevent Xen from using
 speculation barriers to protect selected conditional branches.  By default,
 Xen will enable this mitigation.
+
+On hardware supporting SRBDS_CTRL, the `srb-lock=` option can be used to force
+or prevent Xen from protect the Special Register Buffer from leaking stale
+data. By default, Xen will enable this mitigation, except on parts where MDS
+is fixed and TAA is fixed/mitigated (in which case, there is believed to be no
+way for an attacker to obtain the stale data).
 
 ### sync_console
 > `= <boolean>`

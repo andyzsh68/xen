@@ -19,25 +19,18 @@
  * along with this program; If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <xen/errno.h>
+#include <xen/domain_page.h>
 #include <xen/event.h>
 #include <xen/guest_access.h>
 #include <xen/iocap.h>
-#include <xen/spinlock.h>
-#include <xen/trace.h>
 
 #include <asm/amd.h>
-#include <asm/apic.h>
 #include <asm/debugreg.h>
 #include <asm/hpet.h>
 #include <asm/hypercall.h>
 #include <asm/mc146818rtc.h>
-#include <asm/p2m.h>
 #include <asm/pv/domain.h>
-#include <asm/pv/traps.h>
 #include <asm/shared.h>
-#include <asm/traps.h>
-#include <asm/x86_emulate.h>
 
 #include <xsm/xsm.h>
 
@@ -54,51 +47,102 @@ struct priv_op_ctxt {
     unsigned int bpmatch;
 };
 
-/* I/O emulation support. Helper routines for, and type of, the stack stub. */
-void host_to_guest_gpr_switch(struct cpu_user_regs *);
-unsigned long guest_to_host_gpr_switch(unsigned long);
+/* I/O emulation helpers.  Use non-standard calling conventions. */
+void nocall load_guest_gprs(struct cpu_user_regs *);
+void nocall save_guest_gprs(void);
 
 typedef void io_emul_stub_t(struct cpu_user_regs *);
 
 static io_emul_stub_t *io_emul_stub_setup(struct priv_op_ctxt *ctxt, u8 opcode,
                                           unsigned int port, unsigned int bytes)
 {
+    /*
+     * Construct a stub for IN/OUT emulation.
+     *
+     * Some platform drivers communicate with the SMM handler using GPRs as a
+     * mailbox.  Therefore, we must perform the emulation with the hardware
+     * domain's registers in view.
+     *
+     * We write a stub of the following form, using the guest load/save
+     * helpers (non-standard ABI), and one of several possible stubs
+     * performing the real I/O.
+     */
+    static const char prologue[] = {
+        0x53,       /* push %rbx */
+        0x55,       /* push %rbp */
+        0x41, 0x54, /* push %r12 */
+        0x41, 0x55, /* push %r13 */
+        0x41, 0x56, /* push %r14 */
+        0x41, 0x57, /* push %r15 */
+        0x57,       /* push %rdi (param for save_guest_gprs) */
+    };              /* call load_guest_gprs */
+                    /* <I/O stub> */
+                    /* call save_guest_gprs */
+    static const char epilogue[] = {
+        0x5f,       /* pop %rdi  */
+        0x41, 0x5f, /* pop %r15  */
+        0x41, 0x5e, /* pop %r14  */
+        0x41, 0x5d, /* pop %r13  */
+        0x41, 0x5c, /* pop %r12  */
+        0x5d,       /* pop %rbp  */
+        0x5b,       /* pop %rbx  */
+        0xc3,       /* ret       */
+    };
+
     struct stubs *this_stubs = &this_cpu(stubs);
     unsigned long stub_va = this_stubs->addr + STUB_BUF_SIZE / 2;
-    long disp;
-    bool use_quirk_stub = false;
+    unsigned int quirk_bytes = 0;
+    char *p;
+
+    /* Helpers - Read outer scope but only modify p. */
+#define APPEND_BUFF(b) ({ memcpy(p, b, sizeof(b)); p += sizeof(b); })
+#define APPEND_CALL(f)                                                  \
+    ({                                                                  \
+        long disp = (long)(f) - (stub_va + p - ctxt->io_emul_stub + 5); \
+        BUG_ON((int32_t)disp != disp);                                  \
+        *p++ = 0xe8;                                                    \
+        *(int32_t *)p = disp; p += 4;                                   \
+    })
 
     if ( !ctxt->io_emul_stub )
         ctxt->io_emul_stub =
             map_domain_page(_mfn(this_stubs->mfn)) + (stub_va & ~PAGE_MASK);
 
-    /* call host_to_guest_gpr_switch */
-    ctxt->io_emul_stub[0] = 0xe8;
-    disp = (long)host_to_guest_gpr_switch - (stub_va + 5);
-    BUG_ON((int32_t)disp != disp);
-    *(int32_t *)&ctxt->io_emul_stub[1] = disp;
+    p = ctxt->io_emul_stub;
 
+    APPEND_BUFF(prologue);
+    APPEND_CALL(load_guest_gprs);
+
+    /* Some platforms might need to quirk the stub for specific inputs. */
     if ( unlikely(ioemul_handle_quirk) )
-        use_quirk_stub = ioemul_handle_quirk(opcode, &ctxt->io_emul_stub[5],
-                                             ctxt->ctxt.regs);
-
-    if ( !use_quirk_stub )
     {
-        /* data16 or nop */
-        ctxt->io_emul_stub[5] = (bytes != 2) ? 0x90 : 0x66;
-        /* <io-access opcode> */
-        ctxt->io_emul_stub[6] = opcode;
-        /* imm8 or nop */
-        ctxt->io_emul_stub[7] = !(opcode & 8) ? port : 0x90;
-        /* ret (jumps to guest_to_host_gpr_switch) */
-        ctxt->io_emul_stub[8] = 0xc3;
+        quirk_bytes = ioemul_handle_quirk(opcode, p, ctxt->ctxt.regs);
+        p += quirk_bytes;
     }
 
-    BUILD_BUG_ON(STUB_BUF_SIZE / 2 < MAX(9, /* Default emul stub */
-                                         5 + IOEMUL_QUIRK_STUB_BYTES));
+    /* Default I/O stub. */
+    if ( likely(!quirk_bytes) )
+    {
+        *p++ = (bytes != 2) ? 0x90 : 0x66;  /* data16 or nop */
+        *p++ = opcode;                      /* <opcode>      */
+        *p++ = !(opcode & 8) ? port : 0x90; /* imm8 or nop   */
+    }
+
+    APPEND_CALL(save_guest_gprs);
+    APPEND_BUFF(epilogue);
+
+    /* Build-time best effort attempt to catch problems. */
+    BUILD_BUG_ON(STUB_BUF_SIZE / 2 <
+                 (sizeof(prologue) + sizeof(epilogue) + 10 /* 2x call */ +
+                  MAX(3 /* default stub */, IOEMUL_QUIRK_STUB_BYTES)));
+    /* Runtime confirmation that we haven't clobbered an adjacent stub. */
+    BUG_ON(STUB_BUF_SIZE / 2 < (p - ctxt->io_emul_stub));
 
     /* Handy function-typed pointer to the stub. */
     return (void *)stub_va;
+
+#undef APPEND_CALL
+#undef APPEND_BUFF
 }
 
 
@@ -236,19 +280,9 @@ static uint32_t guest_io_read(unsigned int port, unsigned int bytes,
         {
             sub_data = pv_pit_handler(port, 0, 0);
         }
-        else if ( port == RTC_PORT(0) )
+        else if ( port == RTC_PORT(0) || port == RTC_PORT(1) )
         {
-            sub_data = currd->arch.cmos_idx;
-        }
-        else if ( (port == RTC_PORT(1)) &&
-                  ioports_access_permitted(currd, RTC_PORT(0), RTC_PORT(1)) )
-        {
-            unsigned long flags;
-
-            spin_lock_irqsave(&rtc_lock, flags);
-            outb(currd->arch.cmos_idx & 0x7f, RTC_PORT(0));
-            sub_data = inb(RTC_PORT(1));
-            spin_unlock_irqrestore(&rtc_lock, flags);
+            sub_data = rtc_guest_read(port);
         }
         else if ( (port == 0xcf8) && (bytes == 4) )
         {
@@ -369,21 +403,9 @@ static void guest_io_write(unsigned int port, unsigned int bytes,
         {
             pv_pit_handler(port, (uint8_t)data, 1);
         }
-        else if ( port == RTC_PORT(0) )
+        else if ( port == RTC_PORT(0) || port == RTC_PORT(1) )
         {
-            currd->arch.cmos_idx = data;
-        }
-        else if ( (port == RTC_PORT(1)) &&
-                  ioports_access_permitted(currd, RTC_PORT(0), RTC_PORT(1)) )
-        {
-            unsigned long flags;
-
-            if ( pv_rtc_handler )
-                pv_rtc_handler(currd->arch.cmos_idx & 0x7f, data);
-            spin_lock_irqsave(&rtc_lock, flags);
-            outb(currd->arch.cmos_idx & 0x7f, RTC_PORT(0));
-            outb(data, RTC_PORT(1));
-            spin_unlock_irqrestore(&rtc_lock, flags);
+            rtc_guest_write(port, data);
         }
         else if ( (port == 0xcf8) && (bytes == 4) )
         {

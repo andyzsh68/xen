@@ -63,8 +63,14 @@ struct xc_sr_save_ops
     int (*setup)(struct xc_sr_context *ctx);
 
     /**
-     * Send records which need to be at the start of the stream.  This is
-     * called once, after the Image and Domain headers are written.
+     * Send static records at the head of the stream.  This is called once,
+     * after the Image and Domain headers are written.
+     */
+    int (*static_data)(struct xc_sr_context *ctx);
+
+    /**
+     * Send dynamic records which need to be at the start of the stream.  This
+     * is called after the STATIC_DATA_END record is written.
      */
     int (*start_of_stream)(struct xc_sr_context *ctx);
 
@@ -151,6 +157,15 @@ struct xc_sr_restore_ops
 #define RECORD_NOT_PROCESSED 1
 #define BROKEN_CHANNEL 2
     int (*process_record)(struct xc_sr_context *ctx, struct xc_sr_record *rec);
+
+    /**
+     * Perform any actions required after the static data has arrived.  Called
+     * when the STATIC_DATA_COMPLETE record has been recieved/inferred.
+     * 'missing' should be filled in for any data item the higher level
+     * toolstack needs to provide compatiblity for.
+     */
+    int (*static_data_complete)(struct xc_sr_context *ctx,
+                                unsigned int *missing);
 
     /**
      * Perform any actions required after the stream has been finished. Called
@@ -253,6 +268,9 @@ struct xc_sr_context
             /* Currently buffering records between a checkpoint */
             bool buffer_all_records;
 
+            /* Whether a STATIC_DATA_END record has been seen/inferred. */
+            bool seen_static_data_end;
+
 /*
  * With Remus/COLO, we buffer the records sent by the primary at checkpoint,
  * in case the primary will fail, we can recover from the last
@@ -287,6 +305,16 @@ struct xc_sr_context
     {
         struct /* x86 */
         {
+            /* Common save/restore data. */
+            union
+            {
+                struct
+                {
+                    /* X86_{CPUID,MSR}_DATA blobs for CPU Policy. */
+                    struct xc_sr_blob cpuid, msr;
+                } restore;
+            };
+
             struct /* x86 PV guest. */
             {
                 /* 4 or 8; 32 or 64 bit domain */
@@ -424,6 +452,9 @@ int read_record(struct xc_sr_context *ctx, int fd, struct xc_sr_record *rec);
  */
 int populate_pfns(struct xc_sr_context *ctx, unsigned int count,
                   const xen_pfn_t *original_pfns, const uint32_t *types);
+
+/* Handle a STATIC_DATA_END record. */
+int handle_static_data_end(struct xc_sr_context *ctx);
 
 #endif
 /*

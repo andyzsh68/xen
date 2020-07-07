@@ -7,6 +7,7 @@
  * Copyright (c) 2003-2006, K A Fraser
  */
 
+#include <xen/paging.h>
 #include <xen/sched.h>
 #include <xen/smp.h>
 #include <xen/softirq.h>
@@ -31,6 +32,9 @@
 
 u32 tlbflush_clock = 1U;
 DEFINE_PER_CPU(u32, tlbflush_time);
+
+/* Signals whether the TLB flush clock is in use. */
+bool __read_mostly tlb_clk_enabled = true;
 
 /*
  * pre_flush(): Increment the virtual TLB-flush clock. Returns new clock value.
@@ -59,8 +63,6 @@ static u32 pre_flush(void)
         raise_softirq(NEW_TLBFLUSH_CLOCK_PERIOD_SOFTIRQ);
 
  skip_clocktick:
-    hvm_flush_guest_tlbs();
-
     return t2;
 }
 
@@ -84,12 +86,13 @@ static void post_flush(u32 t)
 static void do_tlb_flush(void)
 {
     unsigned long flags, cr4;
-    u32 t;
+    u32 t = 0;
 
     /* This non-reentrant function is sometimes called in interrupt context. */
     local_irq_save(flags);
 
-    t = pre_flush();
+    if ( tlb_clk_enabled )
+        t = pre_flush();
 
     if ( use_invpcid )
         invpcid_flush_all();
@@ -101,7 +104,8 @@ static void do_tlb_flush(void)
     else
         write_cr3(read_cr3());
 
-    post_flush(t);
+    if ( tlb_clk_enabled )
+        post_flush(t);
 
     local_irq_restore(flags);
 }
@@ -109,7 +113,7 @@ static void do_tlb_flush(void)
 void switch_cr3_cr4(unsigned long cr3, unsigned long cr4)
 {
     unsigned long flags, old_cr4;
-    u32 t;
+    u32 t = 0;
 
     /* Throughout this function we make this assumption: */
     ASSERT(!(cr4 & X86_CR4_PCIDE) || !(cr4 & X86_CR4_PGE));
@@ -117,7 +121,9 @@ void switch_cr3_cr4(unsigned long cr3, unsigned long cr4)
     /* This non-reentrant function is sometimes called in interrupt context. */
     local_irq_save(flags);
 
-    t = pre_flush();
+    if ( tlb_clk_enabled )
+        t = pre_flush();
+    hvm_flush_guest_tlbs();
 
     old_cr4 = read_cr4();
     ASSERT(!(old_cr4 & X86_CR4_PCIDE) || !(old_cr4 & X86_CR4_PGE));
@@ -169,7 +175,8 @@ void switch_cr3_cr4(unsigned long cr3, unsigned long cr4)
     if ( cr4 & X86_CR4_PCIDE )
         invpcid_flush_all_nonglobals();
 
-    post_flush(t);
+    if ( tlb_clk_enabled )
+        post_flush(t);
 
     local_irq_restore(flags);
 }
@@ -221,6 +228,9 @@ unsigned int flush_area_local(const void *va, unsigned int flags)
             do_tlb_flush();
     }
 
+    if ( flags & FLUSH_HVM_ASID_CORE )
+        hvm_flush_guest_tlbs();
+
     if ( flags & FLUSH_CACHE )
     {
         const struct cpuinfo_x86 *c = &current_cpu_data;
@@ -253,4 +263,20 @@ unsigned int flush_area_local(const void *va, unsigned int flags)
         get_cpu_info()->root_pgt_changed = true;
 
     return flags;
+}
+
+unsigned int guest_flush_tlb_flags(const struct domain *d)
+{
+    bool shadow = paging_mode_shadow(d);
+    bool asid = is_hvm_domain(d) && (cpu_has_svm || shadow);
+
+    return (shadow ? FLUSH_TLB : 0) | (asid ? FLUSH_HVM_ASID_CORE : 0);
+}
+
+void guest_flush_tlb_mask(const struct domain *d, const cpumask_t *mask)
+{
+    unsigned int flags = guest_flush_tlb_flags(d);
+
+    if ( flags )
+        flush_mask(mask, flags);
 }

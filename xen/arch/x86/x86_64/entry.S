@@ -191,9 +191,18 @@ restore_all_guest:
         sarq  $47,%rcx
         incl  %ecx
         cmpl  $1,%ecx
-        movq  8(%rsp),%rcx            # RIP
-        ja    iret_exit_to_guest
+        ja    .Lrestore_rcx_iret_exit_to_guest
 
+#ifdef CONFIG_XEN_SHSTK
+        /* Clear the supervisor shadow stack token busy bit. */
+.macro rag_clrssbsy
+        rdsspq %rcx
+        clrssbsy (%rcx)
+.endm
+        ALTERNATIVE "", rag_clrssbsy, X86_FEATURE_XEN_SHSTK
+#endif
+
+        movq  8(%rsp), %rcx           # RIP
         cmpw  $FLAT_USER_CS32,16(%rsp)# CS
         movq  32(%rsp),%rsp           # RSP
         je    1f
@@ -201,6 +210,8 @@ restore_all_guest:
 1:      sysretl
 
         ALIGN
+.Lrestore_rcx_iret_exit_to_guest:
+        movq  8(%rsp), %rcx           # RIP
 /* No special register assumptions. */
 iret_exit_to_guest:
         andl  $~(X86_EFLAGS_IOPL|X86_EFLAGS_NT|X86_EFLAGS_VM),24(%rsp)
@@ -226,6 +237,9 @@ iret_exit_to_guest:
  * %ss must be saved into the space left by the trampoline.
  */
 ENTRY(lstar_enter)
+#ifdef CONFIG_XEN_SHSTK
+        ALTERNATIVE "", "setssbsy", X86_FEATURE_XEN_SHSTK
+#endif
         /* sti could live here when we don't switch page tables below. */
         movq  8(%rsp),%rax /* Restore %rax. */
         movq  $FLAT_KERNEL_SS,8(%rsp)
@@ -259,6 +273,9 @@ ENTRY(lstar_enter)
         jmp   test_all_events
 
 ENTRY(sysenter_entry)
+#ifdef CONFIG_XEN_SHSTK
+        ALTERNATIVE "", "setssbsy", X86_FEATURE_XEN_SHSTK
+#endif
         /* sti could live here when we don't switch page tables below. */
         pushq $FLAT_USER_SS
         pushq $0
@@ -708,7 +725,16 @@ exception_with_ints_disabled:
         call  search_pre_exception_table
         testq %rax,%rax                 # no fixup code for faulting EIP?
         jz    1b
-        movq  %rax,UREGS_rip(%rsp)
+        movq  %rax,UREGS_rip(%rsp)      # fixup regular stack
+
+#ifdef CONFIG_XEN_SHSTK
+        mov    $1, %edi
+        rdsspq %rdi
+        cmp    $1, %edi
+        je     .L_exn_shstk_done
+        wrssq  %rax, 1*8(%rdi)          # fixup shadow stack
+.L_exn_shstk_done:
+#endif
         subq  $8,UREGS_rsp(%rsp)        # add ec/ev to previous stack frame
         testb $15,UREGS_rsp(%rsp)       # return %rsp is now aligned?
         jz    1f                        # then there is a pad quadword already
@@ -795,6 +821,10 @@ ENTRY(alignment_check)
         movl  $TRAP_alignment_check,4(%rsp)
         jmp   handle_exception
 
+ENTRY(entry_CP)
+        movl  $X86_EXC_CP, 4(%rsp)
+        jmp   handle_exception
+
 ENTRY(double_fault)
         movl  $TRAP_double_fault,4(%rsp)
         /* Set AC to reduce chance of further SMAP faults */
@@ -864,6 +894,29 @@ handle_ist_exception:
         movl  $UREGS_kernel_sizeof/8,%ecx
         movq  %rdi,%rsp
         rep   movsq
+
+#ifdef CONFIG_XEN_SHSTK
+        /* Switch Shadow Stacks */
+.macro ist_switch_shstk
+        rdsspq %rdi
+        clrssbsy (%rdi)
+        /*
+         * Switching supervisor shadow stacks is specially hard, as supervisor
+         * and restore tokens are incompatible.
+         *
+         * For now, we only need to switch on to an unused primary shadow
+         * stack, so use SETSSBSY for the purpose, exactly like the
+         * SYSCALL/SYSENTER entry.
+         *
+         * Ideally, we'd want to CLRSSBSY after switching stacks, but that
+         * will leave SSP zeroed so it not an option.  Instead, we transiently
+         * have a zero SSP on this instruction boundary, and depend on IST for
+         * NMI/#MC protection.
+         */
+        setssbsy
+.endm
+        ALTERNATIVE "", ist_switch_shstk, X86_FEATURE_XEN_SHSTK
+#endif
 1:
 #else
         ASSERT_CONTEXT_IS_XEN
@@ -940,7 +993,8 @@ autogen_stubs: /* Automatically generated stubs. */
         entrypoint 1b
 
         /* Reserved exceptions, heading towards do_reserved_trap(). */
-        .elseif vec == TRAP_copro_seg || vec == TRAP_spurious_int || (vec > TRAP_simd_error && vec < TRAP_nr)
+        .elseif vec == X86_EXC_CSO || vec == X86_EXC_SPV || \
+                vec == X86_EXC_VE  || (vec > X86_EXC_CP && vec < TRAP_nr)
 
 1:      test  $8,%spl        /* 64bit exception frames are 16 byte aligned, but the word */
         jz    2f             /* size is 8 bytes.  Check whether the processor gave us an */

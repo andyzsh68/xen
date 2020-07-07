@@ -1,6 +1,7 @@
 obj-$(CONFIG_ARGO) += argo.o
 obj-y += bitmap.o
 obj-y += bsearch.o
+obj-$(CONFIG_HYPFS_CONFIG) += config_data.o
 obj-$(CONFIG_CORE_PARKING) += core_parking.o
 obj-y += cpu.o
 obj-$(CONFIG_DEBUG_TRACE) += debugtrace.o
@@ -14,6 +15,7 @@ obj-$(CONFIG_CRASH_DEBUG) += gdbstub.o
 obj-$(CONFIG_GRANT_TABLE) += grant_table.o
 obj-y += guestcopy.o
 obj-bin-y += gunzip.init.o
+obj-$(CONFIG_HYPFS) += hypfs.o
 obj-y += irq.o
 obj-y += kernel.o
 obj-y += keyhandler.o
@@ -72,3 +74,15 @@ obj-$(CONFIG_UBSAN) += ubsan/
 
 obj-$(CONFIG_NEEDS_LIBELF) += libelf/
 obj-$(CONFIG_HAS_DEVICE_TREE) += libfdt/
+
+CONF_FILE := $(if $(patsubst /%,,$(KCONFIG_CONFIG)),$(XEN_ROOT)/xen/)$(KCONFIG_CONFIG)
+config.gz: $(CONF_FILE)
+	gzip -c $< >$@
+
+config_data.o: config.gz
+
+config_data.S: $(XEN_ROOT)/xen/tools/binfile
+	$(SHELL) $(XEN_ROOT)/xen/tools/binfile $@ config.gz xen_config_data
+
+clean::
+	rm -f config_data.S config.gz 2>/dev/null

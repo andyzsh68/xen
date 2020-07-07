@@ -11,6 +11,7 @@
 #include <asm/io.h>
 #include <asm/mpspec.h>
 #include <asm/apic.h>
+#include <asm/random.h>
 #include <asm/setup.h>
 #include <mach_apic.h>
 #include <public/sysctl.h> /* for XEN_INVALID_{SOCKET,CORE}_ID */
@@ -96,6 +97,11 @@ void __init setup_force_cpu_cap(unsigned int cap)
 	}
 
 	__set_bit(cap, boot_cpu_data.x86_capability);
+}
+
+bool __init is_forced_cpu_cap(unsigned int cap)
+{
+	return test_bit(cap, forced_caps);
 }
 
 static void default_init(struct cpuinfo_x86 * c)
@@ -323,6 +329,11 @@ void __init early_cpu_init(void)
 	       x86_cpuid_vendor_to_str(c->x86_vendor), c->x86, c->x86,
 	       c->x86_model, c->x86_model, c->x86_mask, eax);
 
+	if (c->cpuid_level >= 7) {
+		cpuid_count(7, 0, &eax, &ebx, &ecx, &edx);
+		c->x86_capability[cpufeat_word(X86_FEATURE_CET_SS)] = ecx;
+	}
+
 	eax = cpuid_eax(0x80000000);
 	if ((eax >> 16) == 0x8000 && eax >= 0x80000008) {
 		eax = cpuid_eax(0x80000008);
@@ -488,8 +499,7 @@ void identify_cpu(struct cpuinfo_x86 *c)
 
 	/* Now the feature flags better reflect actual CPU features! */
 
-	if ( cpu_has_xsave )
-		xstate_init(c);
+	xstate_init(c);
 
 #ifdef NOISY_CAPS
 	printk(KERN_DEBUG "CPU: After all inits, caps:");
@@ -497,6 +507,27 @@ void identify_cpu(struct cpuinfo_x86 *c)
 		printk(" %08x", c->x86_capability[i]);
 	printk("\n");
 #endif
+
+	/*
+	 * If RDRAND is available, make an attempt to check that it actually
+	 * (still) works.
+	 */
+	if (cpu_has(c, X86_FEATURE_RDRAND)) {
+		unsigned int prev = 0;
+
+		for (i = 0; i < 5; ++i)
+		{
+			unsigned int cur = arch_get_random();
+
+			if (prev && cur != prev)
+				break;
+			prev = cur;
+		}
+
+		if (i >= 5)
+			printk(XENLOG_WARNING "CPU%u: RDRAND appears to not work\n",
+			       smp_processor_id());
+	}
 
 	if (system_state == SYS_STATE_resume)
 		return;
@@ -704,15 +735,19 @@ static cpumask_t cpu_initialized;
  */
 void load_system_tables(void)
 {
-	unsigned int cpu = smp_processor_id();
+	unsigned int i, cpu = smp_processor_id();
 	unsigned long stack_bottom = get_stack_bottom(),
 		stack_top = stack_bottom & ~(STACK_SIZE - 1);
+	/*
+	 * NB: define tss_page as a local variable because clang 3.5 doesn't
+	 * support using ARRAY_SIZE against per-cpu variables.
+	 */
+	struct tss_page *tss_page = &this_cpu(tss_page);
 
-	struct tss64 *tss = &this_cpu(tss_page).tss;
+	/* The TSS may be live.	 Disuade any clever optimisations. */
+	volatile struct tss64 *tss = &tss_page->tss;
 	seg_desc_t *gdt =
 		this_cpu(gdt) - FIRST_RESERVED_GDT_ENTRY;
-	seg_desc_t *compat_gdt =
-		this_cpu(compat_gdt) - FIRST_RESERVED_GDT_ENTRY;
 
 	const struct desc_ptr gdtr = {
 		.base = (unsigned long)gdt,
@@ -723,37 +758,57 @@ void load_system_tables(void)
 		.limit = (IDT_ENTRIES * sizeof(idt_entry_t)) - 1,
 	};
 
-	*tss = (struct tss64){
-		/* Main stack for interrupts/exceptions. */
-		.rsp0 = stack_bottom,
+	/*
+	 * Set up the TSS.  Warning - may be live, and the NMI/#MC must remain
+	 * valid on every instruction boundary.  (Note: these are all
+	 * semantically ACCESS_ONCE() due to tss's volatile qualifier.)
+	 *
+	 * rsp0 refers to the primary stack.  #MC, NMI, #DB and #DF handlers
+	 * each get their own stacks.  No IO Bitmap.
+	 */
+	tss->rsp0 = stack_bottom;
+	tss->ist[IST_MCE - 1] = stack_top + (1 + IST_MCE) * PAGE_SIZE;
+	tss->ist[IST_NMI - 1] = stack_top + (1 + IST_NMI) * PAGE_SIZE;
+	tss->ist[IST_DB  - 1] = stack_top + (1 + IST_DB)  * PAGE_SIZE;
+	tss->ist[IST_DF  - 1] = stack_top + (1 + IST_DF)  * PAGE_SIZE;
+	tss->bitmap = IOBMP_INVALID_OFFSET;
 
-		/* Ring 1 and 2 stacks poisoned. */
-		.rsp1 = 0x8600111111111111ul,
-		.rsp2 = 0x8600111111111111ul,
+	/* All other stack pointers poisioned. */
+	for ( i = IST_MAX; i < ARRAY_SIZE(tss->ist); ++i )
+		tss->ist[i] = 0x8600111111111111ul;
+	tss->rsp1 = 0x8600111111111111ul;
+	tss->rsp2 = 0x8600111111111111ul;
 
-		/*
-		 * MCE, NMI and Double Fault handlers get their own stacks.
-		 * All others poisoned.
-		 */
-		.ist = {
-			[IST_MCE - 1] = stack_top + IST_MCE * PAGE_SIZE,
-			[IST_DF  - 1] = stack_top + IST_DF  * PAGE_SIZE,
-			[IST_NMI - 1] = stack_top + IST_NMI * PAGE_SIZE,
-			[IST_DB  - 1] = stack_top + IST_DB  * PAGE_SIZE,
+	/*
+	 * Set up the shadow stack IST.  Used entries must point at the
+	 * supervisor stack token.  Unused entries are poisoned.
+	 *
+	 * This IST Table may be live, and the NMI/#MC entries must
+	 * remain valid on every instruction boundary, hence the
+	 * volatile qualifier.
+	 */
+	if (cpu_has_xen_shstk) {
+		volatile uint64_t *ist_ssp = tss_page->ist_ssp;
 
-			[IST_MAX ... ARRAY_SIZE(tss->ist) - 1] =
-				0x8600111111111111ul,
-		},
+		ist_ssp[0] = 0x8600111111111111ul;
+		ist_ssp[IST_MCE] = stack_top + (IST_MCE * IST_SHSTK_SIZE) - 8;
+		ist_ssp[IST_NMI] = stack_top + (IST_NMI * IST_SHSTK_SIZE) - 8;
+		ist_ssp[IST_DB]	 = stack_top + (IST_DB	* IST_SHSTK_SIZE) - 8;
+		ist_ssp[IST_DF]	 = stack_top + (IST_DF	* IST_SHSTK_SIZE) - 8;
+		for ( i = IST_DF + 1; i < ARRAY_SIZE(tss_page->ist_ssp); ++i )
+			ist_ssp[i] = 0x8600111111111111ul;
 
-		.bitmap = IOBMP_INVALID_OFFSET,
-	};
+		wrmsrl(MSR_INTERRUPT_SSP_TABLE, (unsigned long)ist_ssp);
+	}
 
 	BUILD_BUG_ON(sizeof(*tss) <= 0x67); /* Mandated by the architecture. */
 
 	_set_tssldt_desc(gdt + TSS_ENTRY, (unsigned long)tss,
 			 sizeof(*tss) - 1, SYS_DESC_tss_avail);
-	_set_tssldt_desc(compat_gdt + TSS_ENTRY, (unsigned long)tss,
-			 sizeof(*tss) - 1, SYS_DESC_tss_busy);
+	if ( IS_ENABLED(CONFIG_PV32) )
+		_set_tssldt_desc(
+			this_cpu(compat_gdt) - FIRST_RESERVED_GDT_ENTRY + TSS_ENTRY,
+			(unsigned long)tss, sizeof(*tss) - 1, SYS_DESC_tss_busy);
 
 	per_cpu(full_gdt_loaded, cpu) = false;
 	lgdt(&gdtr);
@@ -789,8 +844,6 @@ void cpu_init(void)
 	}
 	if (opt_cpu_info)
 		printk("Initializing CPU#%d\n", cpu);
-
-	wrmsrl(MSR_IA32_CR_PAT, XEN_MSR_PAT);
 
 	/* Install correct page table. */
 	write_ptbase(current);

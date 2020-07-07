@@ -1,4 +1,5 @@
 .hg
+.*.cmd
 .*.tmp
 *.orig
 *~
@@ -109,6 +110,8 @@ tools/libs/evtchn/headers.chk
 tools/libs/evtchn/xenevtchn.pc
 tools/libs/gnttab/headers.chk
 tools/libs/gnttab/xengnttab.pc
+tools/libs/hypfs/headers.chk
+tools/libs/hypfs/xenhypfs.pc
 tools/libs/call/headers.chk
 tools/libs/call/xencall.pc
 tools/libs/foreignmemory/headers.chk
@@ -295,6 +298,8 @@ xen/arch/*/efi/boot.c
 xen/arch/*/efi/compat.c
 xen/arch/*/efi/efi.h
 xen/arch/*/efi/runtime.c
+xen/common/config_data.S
+xen/common/config.gz
 xen/include/headers*.chk
 xen/include/asm
 xen/include/asm-*/asm-offsets.h
@@ -313,6 +318,7 @@ xen/test/livepatch/*.livepatch
 xen/tools/kconfig/.tmp_gtkcheck
 xen/tools/kconfig/.tmp_qtcheck
 xen/tools/symbols
+xen/xsm/flask/flask-policy.S
 xen/xsm/flask/include/av_perm_to_string.h
 xen/xsm/flask/include/av_permissions.h
 xen/xsm/flask/include/class_to_string.h
@@ -364,10 +370,12 @@ tools/libxl/test_timedereg
 tools/libxl/test_fdderegrace
 tools/firmware/etherboot/eb-roms.h
 tools/firmware/etherboot/gpxe-git-snapshot.tar.gz
+tools/misc/xenhypfs
 tools/misc/xenwatchdogd
 tools/misc/xen-hvmcrash
 tools/misc/xen-lowmemd
 tools/libvchan/vchan-node[12]
+tools/libvchan/vchan-socket-proxy
 tools/ocaml/*/.ocamldep.make
 tools/ocaml/*/*.cm[ixao]
 tools/ocaml/*/*.cmxa

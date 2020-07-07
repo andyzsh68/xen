@@ -844,7 +844,7 @@ static inline bool is_vcpu_dirty_cpu(unsigned int cpu)
 
 static inline bool vcpu_cpu_dirty(const struct vcpu *v)
 {
-    return is_vcpu_dirty_cpu(v->dirty_cpu);
+    return is_vcpu_dirty_cpu(read_atomic(&v->dirty_cpu));
 }
 
 void vcpu_block(void);
@@ -985,7 +985,11 @@ static always_inline bool is_pv_vcpu(const struct vcpu *v)
 #ifdef CONFIG_COMPAT
 static always_inline bool is_pv_32bit_domain(const struct domain *d)
 {
-    return is_pv_domain(d) && d->arch.is_32bit_pv;
+#ifdef CONFIG_PV32
+    return is_pv_domain(d) && d->arch.pv.is_32bit;
+#else
+    return false;
+#endif
 }
 
 static always_inline bool is_pv_32bit_vcpu(const struct vcpu *v)
@@ -995,7 +999,14 @@ static always_inline bool is_pv_32bit_vcpu(const struct vcpu *v)
 
 static always_inline bool is_pv_64bit_domain(const struct domain *d)
 {
-    return is_pv_domain(d) && !d->arch.is_32bit_pv;
+    if ( !is_pv_domain(d) )
+        return false;
+
+#ifdef CONFIG_PV32
+    return !d->arch.pv.is_32bit;
+#else
+    return true;
+#endif
 }
 
 static always_inline bool is_pv_64bit_vcpu(const struct vcpu *v)

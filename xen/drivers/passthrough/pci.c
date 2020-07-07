@@ -760,7 +760,6 @@ int pci_add_device(u16 seg, u8 bus, u8 devfn,
             {
                 unsigned int idx = pos + PCI_SRIOV_BAR + i * 4;
                 uint32_t bar = pci_conf_read32(pdev->sbdf, idx);
-                pci_sbdf_t sbdf = PCI_SBDF3(seg, bus, devfn);
 
                 if ( (bar & PCI_BASE_ADDRESS_SPACE) ==
                      PCI_BASE_ADDRESS_SPACE_IO )
@@ -771,7 +770,8 @@ int pci_add_device(u16 seg, u8 bus, u8 devfn,
                            seg, bus, slot, func, i);
                     continue;
                 }
-                ret = pci_size_mem_bar(sbdf, idx, NULL, &pdev->vf_rlen[i],
+                ret = pci_size_mem_bar(pdev->sbdf, idx, NULL,
+                                       &pdev->vf_rlen[i],
                                        PCI_BAR_VF |
                                        ((i == PCI_SRIOV_NUM_BARS - 1) ?
                                         PCI_BAR_LAST : 0));
@@ -873,7 +873,14 @@ static int pci_clean_dpci_irq(struct domain *d,
         xfree(digl);
     }
 
-    return pt_pirq_softirq_active(pirq_dpci) ? -ERESTART : 0;
+    radix_tree_delete(&d->pirq_tree, dpci_pirq(pirq_dpci)->pirq);
+
+    if ( !pt_pirq_softirq_active(pirq_dpci) )
+        return 0;
+
+    domain_get_irq_dpci(d)->pending_pirq_dpci = pirq_dpci;
+
+    return -ERESTART;
 }
 
 static int pci_clean_dpci_irqs(struct domain *d)
@@ -890,8 +897,18 @@ static int pci_clean_dpci_irqs(struct domain *d)
     hvm_irq_dpci = domain_get_irq_dpci(d);
     if ( hvm_irq_dpci != NULL )
     {
-        int ret = pt_pirq_iterate(d, pci_clean_dpci_irq, NULL);
+        int ret = 0;
 
+        if ( hvm_irq_dpci->pending_pirq_dpci )
+        {
+            if ( pt_pirq_softirq_active(hvm_irq_dpci->pending_pirq_dpci) )
+                 ret = -ERESTART;
+            else
+                 hvm_irq_dpci->pending_pirq_dpci = NULL;
+        }
+
+        if ( !ret )
+            ret = pt_pirq_iterate(d, pci_clean_dpci_irq, NULL);
         if ( ret )
         {
             spin_unlock(&d->event_lock);

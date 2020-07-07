@@ -53,6 +53,7 @@
 #include <asm/spec_ctrl.h>
 #include <asm/guest.h>
 #include <asm/microcode.h>
+#include <asm/pv/domain.h>
 
 /* opt_nosmp: If true, secondary processors are ignored. */
 static bool __initdata opt_nosmp;
@@ -93,6 +94,40 @@ boolean_param("cpuidle", xen_cpuidle);
 unsigned long __initdata highmem_start;
 size_param("highmem-start", highmem_start);
 #endif
+
+#ifdef CONFIG_XEN_SHSTK
+static bool __initdata opt_xen_shstk = true;
+#else
+#define opt_xen_shstk false
+#endif
+
+static int __init parse_cet(const char *s)
+{
+    const char *ss;
+    int val, rc = 0;
+
+    do {
+        ss = strchr(s, ',');
+        if ( !ss )
+            ss = strchr(s, '\0');
+
+        if ( (val = parse_boolean("shstk", s, ss)) >= 0 )
+        {
+#ifdef CONFIG_XEN_SHSTK
+            opt_xen_shstk = val;
+#else
+            no_config_param("XEN_SHSTK", "cet", s, ss);
+#endif
+        }
+        else
+            rc = -EINVAL;
+
+        s = ss + 1;
+    } while ( *ss );
+
+    return rc;
+}
+custom_param("cet", parse_cet);
 
 cpumask_t __read_mostly cpu_present_map;
 
@@ -633,6 +668,14 @@ static void __init noreturn reinit_bsp_stack(void)
     stack_base[0] = stack;
     memguard_guard_stack(stack);
 
+    if ( IS_ENABLED(CONFIG_XEN_SHSTK) && cpu_has_xen_shstk )
+    {
+        wrmsrl(MSR_PL0_SSP,
+               (unsigned long)stack + (PRIMARY_SHSTK_SLOT + 1) * PAGE_SIZE - 8);
+        wrmsrl(MSR_S_CET, CET_SHSTK_EN | CET_WRSS_EN);
+        asm volatile ("setssbsy" ::: "memory");
+    }
+
     reset_stack_and_jump_nolp(init_done);
 }
 
@@ -680,6 +723,92 @@ static unsigned int __init copy_bios_e820(struct e820entry *map, unsigned int li
     return n;
 }
 
+static struct domain *__init create_dom0(const module_t *image,
+                                         unsigned long headroom,
+                                         module_t *initrd, const char *kextra,
+                                         const char *loader)
+{
+    struct xen_domctl_createdomain dom0_cfg = {
+        .flags = IS_ENABLED(CONFIG_TBOOT) ? XEN_DOMCTL_CDF_s3_integrity : 0,
+        .max_evtchn_port = -1,
+        .max_grant_frames = -1,
+        .max_maptrack_frames = -1,
+        .max_vcpus = dom0_max_vcpus(),
+    };
+    struct domain *d;
+    char *cmdline;
+
+    if ( opt_dom0_pvh )
+    {
+        dom0_cfg.flags |= (XEN_DOMCTL_CDF_hvm |
+                           ((hvm_hap_supported() && !opt_dom0_shadow) ?
+                            XEN_DOMCTL_CDF_hap : 0));
+
+        dom0_cfg.arch.emulation_flags |=
+            XEN_X86_EMU_LAPIC | XEN_X86_EMU_IOAPIC | XEN_X86_EMU_VPCI;
+    }
+
+    if ( iommu_enabled )
+        dom0_cfg.flags |= XEN_DOMCTL_CDF_iommu;
+
+    /* Create initial domain 0. */
+    d = domain_create(get_initial_domain_id(), &dom0_cfg, !pv_shim);
+    if ( IS_ERR(d) || (alloc_dom0_vcpu0(d) == NULL) )
+        panic("Error creating domain 0\n");
+
+    /* Grab the DOM0 command line. */
+    cmdline = image->string ? __va(image->string) : NULL;
+    if ( cmdline || kextra )
+    {
+        static char __initdata dom0_cmdline[MAX_GUEST_CMDLINE];
+
+        cmdline = cmdline_cook(cmdline, loader);
+        safe_strcpy(dom0_cmdline, cmdline);
+
+        if ( kextra )
+            /* kextra always includes exactly one leading space. */
+            safe_strcat(dom0_cmdline, kextra);
+
+        /* Append any extra parameters. */
+        if ( skip_ioapic_setup && !strstr(dom0_cmdline, "noapic") )
+            safe_strcat(dom0_cmdline, " noapic");
+        if ( (strlen(acpi_param) == 0) && acpi_disabled )
+        {
+            printk("ACPI is disabled, notifying Domain 0 (acpi=off)\n");
+            safe_strcpy(acpi_param, "off");
+        }
+        if ( (strlen(acpi_param) != 0) && !strstr(dom0_cmdline, "acpi=") )
+        {
+            safe_strcat(dom0_cmdline, " acpi=");
+            safe_strcat(dom0_cmdline, acpi_param);
+        }
+
+        cmdline = dom0_cmdline;
+    }
+
+    /*
+     * Temporarily clear SMAP in CR4 to allow user-accesses in construct_dom0().
+     * This saves a large number of corner cases interactions with
+     * copy_from_user().
+     */
+    if ( cpu_has_smap )
+    {
+        cr4_pv32_mask &= ~X86_CR4_SMAP;
+        write_cr4(read_cr4() & ~X86_CR4_SMAP);
+    }
+
+    if ( construct_dom0(d, image, headroom, initrd, cmdline) != 0 )
+        panic("Could not construct domain 0\n");
+
+    if ( cpu_has_smap )
+    {
+        write_cr4(read_cr4() | X86_CR4_SMAP);
+        cr4_pv32_mask |= X86_CR4_SMAP;
+    }
+
+    return d;
+}
+
 /* How much of the directmap is prebuilt at compile time. */
 #define PREBUILT_MAP_LIMIT (1 << L2_PAGETABLE_SHIFT)
 
@@ -698,12 +827,6 @@ void __init noreturn __start_xen(unsigned long mbi_p)
         .data_bits = 8,
         .parity    = 'n',
         .stop_bits = 1
-    };
-    struct xen_domctl_createdomain dom0_cfg = {
-        .flags = IS_ENABLED(CONFIG_TBOOT) ? XEN_DOMCTL_CDF_s3_integrity : 0,
-        .max_evtchn_port = -1,
-        .max_grant_frames = -1,
-        .max_maptrack_frames = -1,
     };
     const char *hypervisor_name;
 
@@ -728,11 +851,6 @@ void __init noreturn __start_xen(unsigned long mbi_p)
 
     if ( pvh_boot )
     {
-        /*
-         * Force xen console to be enabled. We will reset it later in console
-         * initialisation code.
-         */
-        opt_console_xen = -1;
         ASSERT(mbi_p == 0);
         pvh_init(&mbi, &mod);
     }
@@ -958,6 +1076,21 @@ void __init noreturn __start_xen(unsigned long mbi_p)
 
     /* This must come before e820 code because it sets paddr_bits. */
     early_cpu_init();
+
+    /* Choose shadow stack early, to set infrastructure up appropriately. */
+    if ( opt_xen_shstk && boot_cpu_has(X86_FEATURE_CET_SS) )
+    {
+        printk("Enabling Supervisor Shadow Stacks\n");
+
+        setup_force_cpu_cap(X86_FEATURE_XEN_SHSTK);
+#ifdef CONFIG_PV32
+        if ( opt_pv32 )
+        {
+            opt_pv32 = 0;
+            printk("  - Disabling PV32 due to Shadow Stacks\n");
+        }
+#endif
+    }
 
     /* Sanitise the raw E820 map to produce a final clean version. */
     max_page = raw_max_page = init_e820(memmap_type, &e820_raw);
@@ -1695,6 +1828,10 @@ void __init noreturn __start_xen(unsigned long mbi_p)
 
     alternative_branches();
 
+    /* Defer CR4.CET until alternatives have finished playing with CR0.WP */
+    if ( cpu_has_xen_shstk )
+        set_in_cr4(X86_CR4_CET);
+
     /*
      * NB: when running as a PV shim VCPUOP_up/down is wired to the shim
      * physical cpu_add/remove functions, so launch the guest with only
@@ -1746,57 +1883,12 @@ void __init noreturn __start_xen(unsigned long mbi_p)
     init_guest_cpuid();
     init_guest_msr_policy();
 
-    if ( opt_dom0_pvh )
-    {
-        dom0_cfg.flags |= (XEN_DOMCTL_CDF_hvm |
-                           ((hvm_hap_supported() && !opt_dom0_shadow) ?
-                            XEN_DOMCTL_CDF_hap : 0));
-
-        dom0_cfg.arch.emulation_flags |=
-            XEN_X86_EMU_LAPIC | XEN_X86_EMU_IOAPIC | XEN_X86_EMU_VPCI;
-    }
-    dom0_cfg.max_vcpus = dom0_max_vcpus();
-
-    if ( iommu_enabled )
-        dom0_cfg.flags |= XEN_DOMCTL_CDF_iommu;
-
-    /* Create initial domain 0. */
-    dom0 = domain_create(get_initial_domain_id(), &dom0_cfg, !pv_shim);
-    if ( IS_ERR(dom0) || (alloc_dom0_vcpu0(dom0) == NULL) )
-        panic("Error creating domain 0\n");
-
-    /* Grab the DOM0 command line. */
-    cmdline = (char *)(mod[0].string ? __va(mod[0].string) : NULL);
-    if ( (cmdline != NULL) || (kextra != NULL) )
-    {
-        static char __initdata dom0_cmdline[MAX_GUEST_CMDLINE];
-
-        cmdline = cmdline_cook(cmdline, loader);
-        safe_strcpy(dom0_cmdline, cmdline);
-
-        if ( kextra != NULL )
-            /* kextra always includes exactly one leading space. */
-            safe_strcat(dom0_cmdline, kextra);
-
-        /* Append any extra parameters. */
-        if ( skip_ioapic_setup && !strstr(dom0_cmdline, "noapic") )
-            safe_strcat(dom0_cmdline, " noapic");
-        if ( (strlen(acpi_param) == 0) && acpi_disabled )
-        {
-            printk("ACPI is disabled, notifying Domain 0 (acpi=off)\n");
-            safe_strcpy(acpi_param, "off");
-        }
-        if ( (strlen(acpi_param) != 0) && !strstr(dom0_cmdline, "acpi=") )
-        {
-            safe_strcat(dom0_cmdline, " acpi=");
-            safe_strcat(dom0_cmdline, acpi_param);
-        }
-
-        cmdline = dom0_cmdline;
-    }
-
     if ( xen_cpuidle )
         xen_processor_pmbits |= XEN_PROCESSOR_PM_CX;
+
+    printk("%sNX (Execute Disable) protection %sactive\n",
+           cpu_has_nx ? XENLOG_INFO : XENLOG_WARNING "Warning: ",
+           cpu_has_nx ? "" : "not ");
 
     initrdidx = find_first_bit(module_map, mbi->mods_count);
     if ( bitmap_weight(module_map, mbi->mods_count) > 1 )
@@ -1805,34 +1897,14 @@ void __init noreturn __start_xen(unsigned long mbi_p)
                initrdidx);
 
     /*
-     * Temporarily clear SMAP in CR4 to allow user-accesses in construct_dom0().
-     * This saves a large number of corner cases interactions with
-     * copy_from_user().
-     */
-    if ( cpu_has_smap )
-    {
-        cr4_pv32_mask &= ~X86_CR4_SMAP;
-        write_cr4(read_cr4() & ~X86_CR4_SMAP);
-    }
-
-    printk("%sNX (Execute Disable) protection %sactive\n",
-           cpu_has_nx ? XENLOG_INFO : XENLOG_WARNING "Warning: ",
-           cpu_has_nx ? "" : "not ");
-
-    /*
      * We're going to setup domain0 using the module(s) that we stashed safely
      * above our heap. The second module, if present, is an initrd ramdisk.
      */
-    if ( construct_dom0(dom0, mod, modules_headroom,
-                        (initrdidx > 0) && (initrdidx < mbi->mods_count)
-                        ? mod + initrdidx : NULL, cmdline) != 0)
+    dom0 = create_dom0(mod, modules_headroom,
+                       initrdidx < mbi->mods_count ? mod + initrdidx : NULL,
+                       kextra, loader);
+    if ( !dom0 )
         panic("Could not set up DOM0 guest OS\n");
-
-    if ( cpu_has_smap )
-    {
-        write_cr4(read_cr4() | X86_CR4_SMAP);
-        cr4_pv32_mask |= X86_CR4_SMAP;
-    }
 
     heap_init_late();
 
@@ -1875,8 +1947,12 @@ void arch_get_xen_caps(xen_capabilities_info_t *info)
     {
         snprintf(s, sizeof(s), "xen-%d.%d-x86_64 ", major, minor);
         safe_strcat(*info, s);
-        snprintf(s, sizeof(s), "xen-%d.%d-x86_32p ", major, minor);
-        safe_strcat(*info, s);
+
+        if ( opt_pv32 )
+        {
+            snprintf(s, sizeof(s), "xen-%d.%d-x86_32p ", major, minor);
+            safe_strcat(*info, s);
+        }
     }
     if ( hvm_enabled )
     {

@@ -21,6 +21,7 @@
 #include <xen/iocap.h>
 #include <xen/paging.h>
 #include <asm/irq.h>
+#include <asm/hvm/emulate.h>
 #include <asm/hvm/hvm.h>
 #include <asm/hvm/support.h>
 #include <asm/processor.h>
@@ -576,8 +577,8 @@ long arch_do_domctl(
             ret = -EOPNOTSUPP;
         else if ( is_pv_domain(d) )
         {
-            if ( ((domctl->u.address_size.size == 64) && !d->arch.is_32bit_pv) ||
-                 ((domctl->u.address_size.size == 32) && d->arch.is_32bit_pv) )
+            if ( ((domctl->u.address_size.size == 64) && !d->arch.pv.is_32bit) ||
+                 ((domctl->u.address_size.size == 32) &&  d->arch.pv.is_32bit) )
                 ret = 0;
             else if ( domctl->u.address_size.size == 32 )
                 ret = switch_compat(d);
@@ -1147,11 +1148,16 @@ long arch_do_domctl(
             else
             {
                 vcpu_pause(v);
+
                 v->arch.xcr0 = _xcr0;
                 v->arch.xcr0_accum = _xcr0_accum;
                 v->arch.nonlazy_xstate_used = _xcr0_accum & XSTATE_NONLAZY;
                 compress_xsave_states(v, _xsave_area,
                                       evc->size - PV_XSAVE_HDR_SIZE);
+
+                if ( is_hvm_domain(d) )
+                    hvmemul_cancel(v);
+
                 vcpu_unpause(v);
             }
 
@@ -1577,7 +1583,7 @@ void arch_get_info_guest(struct vcpu *v, vcpu_guest_context_u c)
     }
     else
     {
-        c(ldt_base = v->arch.pv.ldt_base);
+        c(ldt_base = v->arch.pv.ldt_ents ? v->arch.pv.ldt_base : 0);
         c(ldt_ents = v->arch.pv.ldt_ents);
         for ( i = 0; i < ARRAY_SIZE(v->arch.pv.gdt_frames); ++i )
             c(gdt_frames[i] = v->arch.pv.gdt_frames[i]);

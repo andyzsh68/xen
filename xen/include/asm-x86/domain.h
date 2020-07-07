@@ -117,8 +117,10 @@ struct shadow_domain {
     /* OOS */
     bool_t oos_active;
 
+#ifdef CONFIG_HVM
     /* Has this domain ever used HVMOP_pagetable_dying? */
     bool_t pagetable_dying_op;
+#endif
 
 #ifdef CONFIG_PV
     /* PV L1 Terminal Fault mitigation. */
@@ -137,10 +139,12 @@ struct shadow_vcpu {
     unsigned long last_emulated_mfn_for_unshadow;
     /* MFN of the last shadow that we shot a writeable mapping in */
     unsigned long last_writeable_pte_smfn;
+#ifdef CONFIG_HVM
     /* Last frame number that we emulated a write to. */
     unsigned long last_emulated_frame;
     /* Last MFN that we emulated a write successfully */
     unsigned long last_emulated_mfn;
+#endif
 
     /* Shadow out-of-sync: pages that this vcpu has let go out of sync */
     mfn_t oos[SHADOW_OOS_PAGES];
@@ -151,7 +155,9 @@ struct shadow_vcpu {
         unsigned long off[SHADOW_OOS_FIXUPS];
     } oos_fixup[SHADOW_OOS_PAGES];
 
+#ifdef CONFIG_HVM
     bool_t pagetable_dying;
+#endif
 #endif
 };
 
@@ -225,10 +231,12 @@ struct paging_vcpu {
     const struct paging_mode *mode;
     /* Nested Virtualization: paging mode of nested guest */
     const struct paging_mode *nestedmode;
+#ifdef CONFIG_HVM
     /* HVM guest: last emulate was to a pagetable */
     unsigned int last_write_was_pt:1;
     /* HVM guest: last write emulation succeeds */
     unsigned int last_write_emul_ok:1;
+#endif
     /* Translated guest: virtual TLB */
     struct shadow_vtlb *vtlb;
     spinlock_t          vtlb_lock;
@@ -254,6 +262,8 @@ struct pv_domain
 
     atomic_t nr_l4_pages;
 
+    /* Is a 32-bit PV guest? */
+    bool is_32bit;
     /* XPTI active? */
     bool xpti;
     /* Use PCID feature? */
@@ -274,6 +284,8 @@ struct monitor_write_data {
         unsigned int cr3 : 1;
         unsigned int cr4 : 1;
     } do_write;
+
+    bool cr3_noflush;
 
     uint32_t msr;
     uint64_t value;
@@ -333,8 +345,6 @@ struct arch_domain
     /* NB. protected by d->event_lock and by irq_desc[irq].lock */
     struct radix_tree_root irq_pirq;
 
-    /* Is a 32-bit PV (non-HVM) guest? */
-    bool_t is_32bit_pv;
     /* Is shared-info page in 32-bit format? */
     bool_t has_32bit_shinfo;
 
@@ -408,6 +418,7 @@ struct arch_domain
          * This is used to filter out pagefaults.
          */
         unsigned int inguest_pagefault_disabled                            : 1;
+        unsigned int control_register_values                               : 1;
         struct monitor_msr_bitmap *msr_bitmap;
         uint64_t write_ctrlreg_mask[4];
     } monitor;
@@ -520,12 +531,6 @@ struct pv_vcpu
     unsigned int iopl;        /* Current IOPL for this VCPU, shifted left by
                                * 12 to match the eflags register. */
 
-#ifdef CONFIG_PV_LDT_PAGING
-    /* Current LDT details. */
-    unsigned long shadow_ldt_mapcnt;
-    spinlock_t shadow_ldt_lock;
-#endif
-
     /*
      * %dr7 bits the guest has set, but aren't loaded into hardware, and are
      * completely emulated.
@@ -581,7 +586,6 @@ struct arch_vcpu
     /* guest_table holds a ref to the page, and also a type-count unless
      * shadow refcounts are in use */
     pagetable_t shadow_table[4];        /* (MFN) shadow(s) of guest */
-    pagetable_t monitor_table;          /* (MFN) hypervisor PT (for HVM) */
     unsigned long cr3;                  /* (MA) value to install in HW CR3 */
 
     /*
@@ -699,6 +703,25 @@ static inline void pv_inject_sw_interrupt(unsigned int vector)
 
     pv_inject_event(&event);
 }
+
+#define PV32_VM_ASSIST_MASK ((1UL << VMASST_TYPE_4gb_segments)        | \
+                             (1UL << VMASST_TYPE_4gb_segments_notify) | \
+                             (1UL << VMASST_TYPE_writable_pagetables) | \
+                             (1UL << VMASST_TYPE_pae_extended_cr3)    | \
+                             (1UL << VMASST_TYPE_architectural_iopl)  | \
+                             (1UL << VMASST_TYPE_runstate_update_flag))
+/*
+ * Various of what PV32_VM_ASSIST_MASK has isn't really applicable to 64-bit,
+ * but we can't make such requests fail all of the sudden.
+ */
+#define PV64_VM_ASSIST_MASK (PV32_VM_ASSIST_MASK                      | \
+                             (1UL << VMASST_TYPE_m2p_strict))
+#define HVM_VM_ASSIST_MASK  (1UL << VMASST_TYPE_runstate_update_flag)
+
+#define arch_vm_assist_valid_mask(d) \
+    (is_hvm_domain(d) ? HVM_VM_ASSIST_MASK \
+                      : is_pv_32bit_domain(d) ? PV32_VM_ASSIST_MASK \
+                                              : PV64_VM_ASSIST_MASK)
 
 #endif /* __ASM_DOMAIN_H__ */
 

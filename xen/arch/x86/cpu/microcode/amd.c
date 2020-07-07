@@ -18,7 +18,6 @@
 #include <xen/init.h>
 #include <xen/mm.h> /* TODO: Fix asm/tlbflush.h breakage */
 
-#include <asm/hvm/svm/svm.h>
 #include <asm/msr.h>
 
 #include "private.h"
@@ -112,6 +111,7 @@ static bool_t verify_patch_size(uint32_t patch_size)
 #define F15H_MPB_MAX_SIZE 4096
 #define F16H_MPB_MAX_SIZE 3458
 #define F17H_MPB_MAX_SIZE 3200
+#define F19H_MPB_MAX_SIZE 4800
 
     switch (boot_cpu_data.x86)
     {
@@ -126,6 +126,9 @@ static bool_t verify_patch_size(uint32_t patch_size)
         break;
     case 0x17:
         max_size = F17H_MPB_MAX_SIZE;
+        break;
+    case 0x19:
+        max_size = F19H_MPB_MAX_SIZE;
         break;
     default:
         max_size = F1XH_MPB_MAX_SIZE;
@@ -391,26 +394,9 @@ static struct microcode_patch *cpu_request_microcode(const void *buf, size_t siz
     return patch;
 }
 
-#ifdef CONFIG_HVM
-static int start_update(void)
-{
-    /*
-     * svm_host_osvw_init() will be called on each cpu by calling '.end_update'
-     * in common code.
-     */
-    svm_host_osvw_reset();
-
-    return 0;
-}
-#endif
-
 const struct microcode_ops amd_ucode_ops = {
     .cpu_request_microcode            = cpu_request_microcode,
     .collect_cpu_info                 = collect_cpu_info,
     .apply_microcode                  = apply_microcode,
-#ifdef CONFIG_HVM
-    .start_update                     = start_update,
-    .end_update_percpu                = svm_host_osvw_init,
-#endif
     .compare_patch                    = compare_patch,
 };

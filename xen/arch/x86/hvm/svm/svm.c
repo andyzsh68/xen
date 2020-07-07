@@ -345,7 +345,7 @@ static int svm_vmcb_restore(struct vcpu *v, struct hvm_hw_cpu *c)
     else
         vmcb->event_inj.raw = 0;
 
-    vmcb->cleanbits.bytes = 0;
+    vmcb->cleanbits.raw = 0;
     paging_update_paging_modes(v);
 
     return 0;
@@ -693,12 +693,12 @@ static void svm_set_segment_register(struct vcpu *v, enum x86_segment seg,
     case x86_seg_ds:
     case x86_seg_es:
     case x86_seg_ss: /* cpl */
-        vmcb->cleanbits.fields.seg = 0;
+        vmcb->cleanbits.seg = false;
         break;
 
     case x86_seg_gdtr:
     case x86_seg_idtr:
-        vmcb->cleanbits.fields.dt = 0;
+        vmcb->cleanbits.dt = false;
         break;
 
     case x86_seg_fs:
@@ -980,7 +980,7 @@ static void svm_ctxt_switch_to(struct vcpu *v)
     svm_restore_dr(v);
 
     svm_vmsave_pa(per_cpu(host_vmcb, cpu));
-    vmcb->cleanbits.bytes = 0;
+    vmcb->cleanbits.raw = 0;
     svm_tsc_ratio_load(v);
 
     if ( cpu_has_msr_tsc_aux )
@@ -1040,6 +1040,8 @@ void svm_vmenter_helper(const struct cpu_user_regs *regs)
     struct vcpu *curr = current;
     struct vmcb_struct *vmcb = curr->arch.hvm.svm.vmcb;
 
+    ASSERT(hvmemul_cache_disabled(curr));
+
     svm_asid_handle_vmrun();
 
     if ( unlikely(tb_init_done) )
@@ -1082,7 +1084,7 @@ static void svm_guest_osvw_init(struct domain *d)
     spin_unlock(&osvw_lock);
 }
 
-void svm_host_osvw_reset()
+static void svm_host_osvw_reset(void)
 {
     spin_lock(&osvw_lock);
 
@@ -1092,7 +1094,7 @@ void svm_host_osvw_reset()
     spin_unlock(&osvw_lock);
 }
 
-void svm_host_osvw_init()
+static void svm_host_osvw_init(void)
 {
     spin_lock(&osvw_lock);
 
@@ -2592,7 +2594,7 @@ void svm_vmexit_handler(struct cpu_user_regs *regs)
 
     hvm_maybe_deassert_evtchn_irq();
 
-    vmcb->cleanbits.bytes = cpu_has_svm_cleanbits ? ~0u : 0u;
+    vmcb->cleanbits.raw = ~0u;
 
     /* Event delivery caused this intercept? Queue for redelivery. */
     if ( unlikely(vmcb->exit_int_info.v) &&
@@ -2921,9 +2923,10 @@ void svm_vmexit_handler(struct cpu_user_regs *regs)
             v->arch.hvm.svm.cached_insn_len = vmcb->guest_ins_len & 0xf;
         rc = vmcb->exitinfo1 & PFEC_page_present
              ? p2m_pt_handle_deferred_changes(vmcb->exitinfo2) : 0;
-        if ( rc >= 0 )
+        if ( rc == 0 )
+            /* If no recal adjustments were being made - handle this fault */
             svm_do_nested_pgfault(v, regs, vmcb->exitinfo1, vmcb->exitinfo2);
-        else
+        else if ( rc < 0 )
         {
             printk(XENLOG_G_ERR
                    "%pv: Error %d handling NPF (gpa=%08lx ec=%04lx)\n",

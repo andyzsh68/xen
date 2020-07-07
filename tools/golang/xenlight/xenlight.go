@@ -14,12 +14,24 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; If not, see <http://www.gnu.org/licenses/>.
  */
+
+// Package xenlight provides bindings to Xen's libxl C library.
 package xenlight
 
 /*
+
 #cgo LDFLAGS: -lxenlight -lyajl -lxentoollog
 #include <stdlib.h>
 #include <libxl.h>
+#include <libxl_utils.h>
+
+#define INVALID_DOMID_TYPED ((uint32_t) INVALID_DOMID)
+
+static const libxl_childproc_hooks childproc_hooks = { .chldowner = libxl_sigchld_owner_mainloop };
+
+void xenlight_set_chldproc(libxl_ctx *ctx) {
+	libxl_childproc_setmode(ctx, &childproc_hooks, NULL);
+}
 */
 import "C"
 
@@ -33,6 +45,9 @@ import "C"
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 	"unsafe"
 )
 
@@ -64,6 +79,10 @@ var libxlErrors = map[Error]string{
 	ErrorFeatureRemoved:               "Feature removed",
 }
 
+const (
+	DomidInvalid Domid = Domid(C.INVALID_DOMID_TYPED)
+)
+
 func (e Error) Error() string {
 	if s, ok := libxlErrors[e]; ok {
 		return s
@@ -74,8 +93,37 @@ func (e Error) Error() string {
 
 // Context represents a libxl_ctx.
 type Context struct {
-	ctx    *C.libxl_ctx
-	logger *C.xentoollog_logger_stdiostream
+	ctx         *C.libxl_ctx
+	logger      *C.xentoollog_logger_stdiostream
+	sigchld     chan os.Signal
+	sigchldDone chan struct{}
+}
+
+// Golang always unmasks SIGCHLD, and internally has ways of
+// distributing SIGCHLD to multiple recipients.  libxl has provision
+// for this model: just tell it when a SIGCHLD happened, and it will
+// look after its own processes.
+//
+// This should "play nicely" with other users of SIGCHLD as long as
+// they don't reap libxl's processes.
+//
+// Every context needs to be notified on each SIGCHLD; so spin up a
+// new goroutine for each context.  If there are a large number of
+// contexts, this means each context will be woken up looking through
+// its own list of children.
+//
+// The alternate would be to register a fork callback, such that the
+// xenlight package can make a single list of all children, and only
+// notify the specific libxl context(s) that have children woken.  But
+// it's not clear to me this will be much more work than having the
+// xenlight go library do the same thing; doing it in separate go
+// threads has the potential to do it in parallel.  Leave that as an
+// optimization for later if it turns out to be a bottleneck.
+func sigchldHandler(ctx *Context) {
+	for _ = range ctx.sigchld {
+		C.libxl_childproc_sigchld_occurred(ctx.ctx)
+	}
+	close(ctx.sigchldDone)
 }
 
 // NewContext returns a new Context.
@@ -89,19 +137,45 @@ func NewContext() (ctx *Context, err error) {
 		}
 	}()
 
+	// Create a logger
 	ctx.logger = C.xtl_createlogger_stdiostream(C.stderr, C.XTL_ERROR, 0)
 
+	// Allocate a context
 	ret := C.libxl_ctx_alloc(&ctx.ctx, C.LIBXL_VERSION, 0,
 		(*C.xentoollog_logger)(unsafe.Pointer(ctx.logger)))
 	if ret != 0 {
 		return ctx, Error(ret)
 	}
 
+	// Tell libxl that we'll be dealing with SIGCHLD...
+	C.xenlight_set_chldproc(ctx.ctx)
+
+	// ...and arrange to keep that promise.
+	ctx.sigchld = make(chan os.Signal, 2)
+	ctx.sigchldDone = make(chan struct{}, 1)
+	signal.Notify(ctx.sigchld, syscall.SIGCHLD)
+
+	// This goroutine will run until the ctx.sigchld is closed in
+	// ctx.Close(); at which point it will close ctx.sigchldDone.
+	go sigchldHandler(ctx)
+
 	return ctx, nil
 }
 
 // Close closes the Context.
 func (ctx *Context) Close() error {
+	// Tell our SIGCHLD notifier to shut down, and wait for it to exit
+	// before we free the context.
+	if ctx.sigchld != nil {
+		signal.Stop(ctx.sigchld)
+		close(ctx.sigchld)
+
+		<-ctx.sigchldDone
+
+		ctx.sigchld = nil
+		ctx.sigchldDone = nil
+	}
+
 	if ctx.ctx != nil {
 		ret := C.libxl_ctx_free(ctx.ctx)
 		if ret != 0 {
@@ -123,6 +197,38 @@ func (ctx *Context) Close() error {
  */
 
 type Domid uint32
+
+// NameToDomid returns the Domid for a domain, given its name, if it exists.
+//
+// NameToDomid does not guarantee that the domid associated with name at
+// the time NameToDomid is called is the same as the domid associated with
+// name at the time NameToDomid returns.
+func (Ctx *Context) NameToDomid(name string) (Domid, error) {
+	var domid C.uint32_t
+
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+
+	if ret := C.libxl_name_to_domid(Ctx.ctx, cname, &domid); ret != 0 {
+		return DomidInvalid, Error(ret)
+	}
+
+	return Domid(domid), nil
+}
+
+// DomidToName returns the name for a domain, given its domid. If there
+// is no domain with the given domid, DomidToName will return the empty
+// string.
+//
+// DomidToName does not guarantee that the name (if any) associated with domid
+// at the time DomidToName is called is the same as the name (if any) associated
+// with domid at the time DomidToName returns.
+func (Ctx *Context) DomidToName(domid Domid) string {
+	cname := C.libxl_domid_to_name(Ctx.ctx, C.uint32_t(domid))
+	defer C.free(unsafe.Pointer(cname))
+
+	return C.GoString(cname)
+}
 
 // Devid is a device ID.
 type Devid int
@@ -1044,4 +1150,124 @@ func (Ctx *Context) PrimaryConsoleGetTty(domid uint32) (path string, err error) 
 
 	path = C.GoString(cpath)
 	return
+}
+
+// DeviceNicAdd adds a nic to a domain.
+func (Ctx *Context) DeviceNicAdd(domid Domid, nic *DeviceNic) error {
+	var cnic C.libxl_device_nic
+
+	if err := nic.toC(&cnic); err != nil {
+		return err
+	}
+	defer C.libxl_device_nic_dispose(&cnic)
+
+	ret := C.libxl_device_nic_add(Ctx.ctx, C.uint32_t(domid), &cnic, nil)
+	if ret != 0 {
+		return Error(ret)
+	}
+
+	return nil
+}
+
+// DeviceNicRemove removes a nic from a domain.
+func (Ctx *Context) DeviceNicRemove(domid Domid, nic *DeviceNic) error {
+	var cnic C.libxl_device_nic
+
+	if err := nic.toC(&cnic); err != nil {
+		return err
+	}
+	defer C.libxl_device_nic_dispose(&cnic)
+
+	ret := C.libxl_device_nic_remove(Ctx.ctx, C.uint32_t(domid), &cnic, nil)
+	if ret != 0 {
+		return Error(ret)
+	}
+
+	return nil
+}
+
+// DevicePciAdd is used to passthrough a PCI device to a domain.
+func (Ctx *Context) DevicePciAdd(domid Domid, pci *DevicePci) error {
+	var cpci C.libxl_device_pci
+
+	if err := pci.toC(&cpci); err != nil {
+		return err
+	}
+	defer C.libxl_device_pci_dispose(&cpci)
+
+	ret := C.libxl_device_pci_add(Ctx.ctx, C.uint32_t(domid), &cpci, nil)
+	if ret != 0 {
+		return Error(ret)
+	}
+
+	return nil
+}
+
+// DevicePciRemove removes a PCI device from a domain.
+func (Ctx *Context) DevicePciRemove(domid Domid, pci *DevicePci) error {
+	var cpci C.libxl_device_pci
+
+	if err := pci.toC(&cpci); err != nil {
+		return err
+	}
+	defer C.libxl_device_pci_dispose(&cpci)
+
+	ret := C.libxl_device_pci_remove(Ctx.ctx, C.uint32_t(domid), &cpci, nil)
+	if ret != 0 {
+		return Error(ret)
+	}
+
+	return nil
+}
+
+// DeviceUsbdevAdd adds a USB device to a domain.
+func (Ctx *Context) DeviceUsbdevAdd(domid Domid, usbdev *DeviceUsbdev) error {
+	var cusbdev C.libxl_device_usbdev
+
+	if err := usbdev.toC(&cusbdev); err != nil {
+		return err
+	}
+	defer C.libxl_device_usbdev_dispose(&cusbdev)
+
+	ret := C.libxl_device_usbdev_add(Ctx.ctx, C.uint32_t(domid), &cusbdev, nil)
+	if ret != 0 {
+		return Error(ret)
+	}
+
+	return nil
+}
+
+// DeviceUsbdevRemove removes a USB device from a domain.
+func (Ctx *Context) DeviceUsbdevRemove(domid Domid, usbdev *DeviceUsbdev) error {
+	var cusbdev C.libxl_device_usbdev
+
+	if err := usbdev.toC(&cusbdev); err != nil {
+		return err
+	}
+	defer C.libxl_device_usbdev_dispose(&cusbdev)
+
+	ret := C.libxl_device_usbdev_remove(Ctx.ctx, C.uint32_t(domid), &cusbdev, nil)
+	if ret != 0 {
+		return Error(ret)
+	}
+
+	return nil
+}
+
+// DomainCreateNew creates a new domain.
+func (Ctx *Context) DomainCreateNew(config *DomainConfig) (Domid, error) {
+	var cdomid C.uint32_t
+	var cconfig C.libxl_domain_config
+	err := config.toC(&cconfig)
+	if err != nil {
+		return Domid(0), fmt.Errorf("converting domain config to C: %v", err)
+	}
+	defer C.libxl_domain_config_dispose(&cconfig)
+
+	ret := C.libxl_domain_create_new(Ctx.ctx, &cconfig, &cdomid, nil, nil)
+	if ret != 0 {
+		return Domid(0), Error(ret)
+	}
+
+	return Domid(cdomid), nil
 }

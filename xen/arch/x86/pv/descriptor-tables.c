@@ -37,14 +37,7 @@ bool pv_destroy_ldt(struct vcpu *v)
 
     ASSERT(!in_irq());
 
-#ifdef CONFIG_PV_LDT_PAGING
-    spin_lock(&v->arch.pv.shadow_ldt_lock);
-
-    if ( v->arch.pv.shadow_ldt_mapcnt == 0 )
-        goto out;
-#else
     ASSERT(v == current || !vcpu_cpu_dirty(v));
-#endif
 
     pl1e = pv_ldt_ptes(v);
 
@@ -61,14 +54,6 @@ bool pv_destroy_ldt(struct vcpu *v)
         ASSERT_PAGE_IS_DOMAIN(page, v->domain);
         put_page_and_type(page);
     }
-
-#ifdef CONFIG_PV_LDT_PAGING
-    ASSERT(v->arch.pv.shadow_ldt_mapcnt == mappings_dropped);
-    v->arch.pv.shadow_ldt_mapcnt = 0;
-
- out:
-    spin_unlock(&v->arch.pv.shadow_ldt_lock);
-#endif
 
     return mappings_dropped;
 }
@@ -96,7 +81,8 @@ void pv_destroy_gdt(struct vcpu *v)
     }
 }
 
-long pv_set_gdt(struct vcpu *v, unsigned long *frames, unsigned int entries)
+int pv_set_gdt(struct vcpu *v, const unsigned long frames[],
+               unsigned int entries)
 {
     struct domain *d = v->domain;
     l1_pgentry_t *pl1e;
@@ -110,17 +96,11 @@ long pv_set_gdt(struct vcpu *v, unsigned long *frames, unsigned int entries)
     /* Check the pages in the new GDT. */
     for ( i = 0; i < nr_frames; i++ )
     {
-        struct page_info *page;
+        mfn_t mfn = _mfn(frames[i]);
 
-        page = get_page_from_gfn(d, frames[i], NULL, P2M_ALLOC);
-        if ( !page )
+        if ( !mfn_valid(mfn) ||
+             !get_page_and_type(mfn_to_page(mfn), d, PGT_seg_desc_page) )
             goto fail;
-        if ( !get_page_type(page, PGT_seg_desc_page) )
-        {
-            put_page(page);
-            goto fail;
-        }
-        frames[i] = mfn_x(page_to_mfn(page));
     }
 
     /* Tear down the old GDT. */
@@ -139,9 +119,8 @@ long pv_set_gdt(struct vcpu *v, unsigned long *frames, unsigned int entries)
 
  fail:
     while ( i-- > 0 )
-    {
         put_page_and_type(mfn_to_page(_mfn(frames[i])));
-    }
+
     return -EINVAL;
 }
 

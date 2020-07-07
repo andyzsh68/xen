@@ -79,6 +79,7 @@ extern u32 svm_feature_flags;
 #define cpu_has_svm_svml      cpu_has_svm_feature(SVM_FEATURE_SVML)
 #define cpu_has_svm_nrips     cpu_has_svm_feature(SVM_FEATURE_NRIPS)
 #define cpu_has_svm_cleanbits cpu_has_svm_feature(SVM_FEATURE_VMCBCLEAN)
+#define cpu_has_svm_flushbyasid cpu_has_svm_feature(SVM_FEATURE_FLUSHBYASID)
 #define cpu_has_svm_decode    cpu_has_svm_feature(SVM_FEATURE_DECODEASSISTS)
 #define cpu_has_svm_vgif      cpu_has_svm_feature(SVM_FEATURE_VGIF)
 #define cpu_has_pause_filter  cpu_has_svm_feature(SVM_FEATURE_PAUSEFILTER)
@@ -92,9 +93,6 @@ extern u32 svm_feature_flags;
 /* TSC rate */
 #define DEFAULT_TSC_RATIO       0x0000000100000000ULL
 #define TSC_RATIO_RSVD_BITS     0xffffff0000000000ULL
-
-extern void svm_host_osvw_reset(void);
-extern void svm_host_osvw_init(void);
 
 /* EXITINFO1 fields on NPT faults */
 #define _NPT_PFEC_with_gla     32

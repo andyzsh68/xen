@@ -79,7 +79,7 @@ def write_libxc_ihdr():
     stream_write(pack(libxc.IHDR_FORMAT,
                       libxc.IHDR_MARKER,  # Marker
                       libxc.IHDR_IDENT,   # Ident
-                      libxc.IHDR_VERSION, # Version
+                      3,                  # Version
                       libxc.IHDR_OPT_LE,  # Options
                       0, 0))              # Reserved
 
@@ -165,6 +165,9 @@ def write_libxc_hvm_params(params):
     write_record(libxc.REC_TYPE_hvm_params,
                  pack(libxc.HVM_PARAMS_FORMAT, len(params) / 2, 0),
                  pack("Q" * len(params), *params))
+
+def write_libxc_static_data_end():
+    write_record(libxc.REC_TYPE_static_data_end)
 
 def write_libxl_end():
     write_record(libxl.REC_TYPE_end)
@@ -590,6 +593,10 @@ def read_legacy_stream(vm):
 
         if pv:
             read_pv_extended_info(vm)
+
+        write_libxc_static_data_end()
+
+        if pv:
             read_pv_p2m_frames(vm)
 
         read_chunks(vm)
@@ -632,13 +639,13 @@ def main():
                           usage = ("%prog [options] -i INPUT -o OUTPUT"
                                    " -w WIDTH -g GUEST"),
                           description =
-                          "Convert a legacy stream to a v2 stream")
+                          "Convert a legacy stream to a v2 (or later) stream")
 
     # Required options
     parser.add_option("-i", "--in", dest = "fin", metavar = "<FD or FILE>",
                       help = "Legacy input to convert")
     parser.add_option("-o", "--out", dest = "fout", metavar = "<FD or FILE>",
-                      help = "v2 format output")
+                      help = "v2 (or later) format output")
     parser.add_option("-w", "--width", dest = "twidth",
                       metavar = "<32/64>", choices = ["32", "64"],
                       help = "Legacy toolstack bitness")

@@ -150,6 +150,16 @@ do_dm_op(
     unsigned int nr_bufs,
     XEN_GUEST_HANDLE_PARAM(xen_dm_op_buf_t) bufs);
 
+#ifdef CONFIG_HYPFS
+extern long
+do_hypfs_op(
+    unsigned int cmd,
+    XEN_GUEST_HANDLE_PARAM(const_char) arg1,
+    unsigned long arg2,
+    XEN_GUEST_HANDLE_PARAM(void) arg3,
+    unsigned long arg4);
+#endif
+
 #ifdef CONFIG_COMPAT
 
 extern int
@@ -191,8 +201,6 @@ extern int compat_xsm_op(
     XEN_GUEST_HANDLE_PARAM(xsm_op_t) op);
 
 extern int compat_kexec_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) uarg);
-
-extern int compat_vm_assist(unsigned int cmd, unsigned int type);
 
 DEFINE_XEN_GUEST_HANDLE(multicall_entry_compat_t);
 extern int compat_multicall(

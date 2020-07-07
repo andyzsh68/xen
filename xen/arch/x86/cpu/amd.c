@@ -4,6 +4,7 @@
 #include <xen/param.h>
 #include <xen/smp.h>
 #include <xen/pci.h>
+#include <xen/warning.h>
 #include <asm/io.h>
 #include <asm/msr.h>
 #include <asm/processor.h>
@@ -532,6 +533,107 @@ static void amd_get_topology(struct cpuinfo_x86 *c)
                                                           : c->cpu_core_id);
 }
 
+void amd_log_freq(const struct cpuinfo_x86 *c)
+{
+	unsigned int idx = 0, h;
+	uint64_t hi, lo, val;
+
+	if (c->x86 < 0x10 || c->x86 > 0x19 ||
+	    (c != &boot_cpu_data &&
+	     (!opt_cpu_info || (c->apicid & (c->x86_num_siblings - 1)))))
+		return;
+
+	if (c->x86 < 0x17) {
+		unsigned int node = 0;
+		uint64_t nbcfg;
+
+		/*
+		 * Make an attempt at determining the node ID, but assume
+		 * symmetric setup (using node 0) if this fails.
+		 */
+		if (c->extended_cpuid_level >= 0x8000001e &&
+		    cpu_has(c, X86_FEATURE_TOPOEXT)) {
+			node = cpuid_ecx(0x8000001e) & 0xff;
+			if (node > 7)
+				node = 0;
+		} else if (cpu_has(c, X86_FEATURE_NODEID_MSR)) {
+			rdmsrl(0xC001100C, val);
+			node = val & 7;
+		}
+
+		/*
+		 * Enable (and use) Extended Config Space accesses, as we
+		 * can't be certain that MCFG is available here during boot.
+		 */
+		rdmsrl(MSR_AMD64_NB_CFG, nbcfg);
+		wrmsrl(MSR_AMD64_NB_CFG,
+		       nbcfg | (1ULL << AMD64_NB_CFG_CF8_EXT_ENABLE_BIT));
+#define PCI_ECS_ADDRESS(sbdf, reg) \
+    (0x80000000 | ((sbdf).bdf << 8) | ((reg) & 0xfc) | (((reg) & 0xf00) << 16))
+
+		for ( ; ; ) {
+			pci_sbdf_t sbdf = PCI_SBDF(0, 0, 0x18 | node, 4);
+
+			switch (pci_conf_read32(sbdf, PCI_VENDOR_ID)) {
+			case 0x00000000:
+			case 0xffffffff:
+				/* No device at this SBDF. */
+				if (!node)
+					break;
+				node = 0;
+				continue;
+
+			default:
+				/*
+				 * Core Performance Boost Control, family
+				 * dependent up to 3 bits starting at bit 2.
+				 *
+				 * Note that boost states operate at a frequency
+				 * above the base one, and thus need to be
+				 * accounted for in order to correctly fetch the
+				 * nominal frequency of the processor.
+				 */
+				switch (c->x86) {
+				case 0x10: idx = 1; break;
+				case 0x12: idx = 7; break;
+				case 0x14: idx = 7; break;
+				case 0x15: idx = 7; break;
+				case 0x16: idx = 7; break;
+				}
+				idx &= pci_conf_read(PCI_ECS_ADDRESS(sbdf,
+				                                     0x15c),
+				                     0, 4) >> 2;
+				break;
+			}
+			break;
+		}
+
+#undef PCI_ECS_ADDRESS
+		wrmsrl(MSR_AMD64_NB_CFG, nbcfg);
+	}
+
+	lo = 0; /* gcc may not recognize the loop having at least 5 iterations */
+	for (h = c->x86 == 0x10 ? 5 : 8; h--; )
+		if (!rdmsr_safe(0xC0010064 + h, lo) && (lo >> 63))
+			break;
+	if (!(lo >> 63))
+		return;
+
+#define FREQ(v) (c->x86 < 0x17 ? ((((v) & 0x3f) + 0x10) * 100) >> (((v) >> 6) & 7) \
+		                     : (((v) & 0xff) * 25 * 8) / (((v) >> 8) & 0x3f))
+	if (idx && idx < h &&
+	    !rdmsr_safe(0xC0010064 + idx, val) && (val >> 63) &&
+	    !rdmsr_safe(0xC0010064, hi) && (hi >> 63))
+		printk("CPU%u: %lu (%lu..%lu) MHz\n",
+		       smp_processor_id(), FREQ(val), FREQ(lo), FREQ(hi));
+	else if (h && !rdmsr_safe(0xC0010064, hi) && (hi >> 63))
+		printk("CPU%u: %lu..%lu MHz\n",
+		       smp_processor_id(), FREQ(lo), FREQ(hi));
+	else
+		printk("CPU%u: %lu MHz\n", smp_processor_id(), FREQ(lo));
+#undef FREQ
+}
+
 void early_init_amd(struct cpuinfo_x86 *c)
 {
 	if (c == &boot_cpu_data)
@@ -645,6 +747,26 @@ static void init_amd(struct cpuinfo_x86 *c)
 		disable_c1e(NULL);
 		if (acpi_smi_cmd && (acpi_enable_value | acpi_disable_value))
 			amd_acpi_c1e_quirk = true;
+		break;
+
+	case 0x15: case 0x16:
+		/*
+		 * There are some Fam15/Fam16 systems where upon resume from S3
+		 * firmware fails to re-setup properly functioning RDRAND.
+		 * By the time we can spot the problem, it is too late to take
+		 * action, and there is nothing Xen can do to repair the problem.
+		 * Clear the feature unless force-enabled on the command line.
+		 */
+		if (c == &boot_cpu_data &&
+		    cpu_has(c, X86_FEATURE_RDRAND) &&
+		    !is_forced_cpu_cap(X86_FEATURE_RDRAND)) {
+			static const char __initconst text[] =
+				"RDRAND may cease to work on this hardware upon resume from S3.\n"
+				"Please choose an explicit cpuid={no-}rdrand setting.\n";
+
+			setup_clear_cpu_cap(X86_FEATURE_RDRAND);
+			warning_add(text);
+		}
 		break;
 	}
 
@@ -803,6 +925,8 @@ static void init_amd(struct cpuinfo_x86 *c)
 		disable_c1_ramping();
 
 	check_syscfg_dram_mod_en();
+
+	amd_log_freq(c);
 }
 
 const struct cpu_dev amd_cpu_dev = {

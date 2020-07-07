@@ -56,14 +56,7 @@ struct arch_domain
     struct vmmio vmmio;
 
     /* Continuable domain_relinquish_resources(). */
-    enum {
-        RELMEM_not_started,
-        RELMEM_tee,
-        RELMEM_xen,
-        RELMEM_page,
-        RELMEM_mapping,
-        RELMEM_done,
-    } relmem;
+    unsigned int rel_priv;
 
     struct {
         uint64_t offset;
@@ -268,6 +261,8 @@ static inline void free_vcpu_guest_context(struct vcpu_guest_context *vgc)
 }
 
 static inline void arch_vcpu_block(struct vcpu *v) {}
+
+#define arch_vm_assist_valid_mask(d) (1UL << VMASST_TYPE_runstate_update_flag)
 
 #endif /* __ASM_DOMAIN_H__ */
 

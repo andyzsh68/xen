@@ -23,7 +23,6 @@ struct xc_sr_ihdr
 
 #define IHDR_MARKER  0xffffffffffffffffULL
 #define IHDR_ID      0x58454E46U
-#define IHDR_VERSION 2
 
 #define _IHDR_OPT_ENDIAN 0
 #define IHDR_OPT_LITTLE_ENDIAN (0 << _IHDR_OPT_ENDIAN)
@@ -74,6 +73,9 @@ struct xc_sr_rhdr
 #define REC_TYPE_VERIFY                     0x0000000dU
 #define REC_TYPE_CHECKPOINT                 0x0000000eU
 #define REC_TYPE_CHECKPOINT_DIRTY_PFN_LIST  0x0000000fU
+#define REC_TYPE_STATIC_DATA_END            0x00000010U
+#define REC_TYPE_X86_CPUID_POLICY           0x00000011U
+#define REC_TYPE_X86_MSR_POLICY             0x00000012U
 
 #define REC_TYPE_OPTIONAL             0x80000000U
 

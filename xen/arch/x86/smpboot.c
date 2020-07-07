@@ -192,7 +192,7 @@ static void smp_callin(void)
      */
     Dprintk("CALLIN, before setup_local_APIC().\n");
     x2apic_ap_setup();
-    setup_local_APIC();
+    setup_local_APIC(false);
 
     /* Save our processor parameters. */
     if ( !smp_store_cpu_info(cpu) )
@@ -329,7 +329,6 @@ void start_secondary(void *unused)
 
     /* Critical region without IDT or TSS.  Any fault is deadly! */
 
-    set_processor_id(cpu);
     set_current(idle_vcpu[cpu]);
     this_cpu(curr_vcpu) = idle_vcpu[cpu];
     rdmsrl(MSR_EFER, this_cpu(efer));
@@ -370,15 +369,17 @@ void start_secondary(void *unused)
 
     initialize_cpu_data(cpu);
 
-    microcode_update_one(false);
+    microcode_update_one();
 
     /*
-     * If MSR_SPEC_CTRL is available, apply Xen's default setting and discard
-     * any firmware settings.  Note: MSR_SPEC_CTRL may only become available
-     * after loading microcode.
+     * If any speculative control MSRs are available, apply Xen's default
+     * settings.  Note: These MSRs may only become available after loading
+     * microcode.
      */
     if ( boot_cpu_has(X86_FEATURE_IBRSB) )
         wrmsrl(MSR_SPEC_CTRL, default_xen_spec_ctrl);
+    if ( boot_cpu_has(X86_FEATURE_SRBDS_CTRL) )
+        wrmsrl(MSR_MCU_OPT_CTRL, default_xen_mcu_opt_ctrl);
 
     tsx_init(); /* Needs microcode.  May change HLE/RTM feature bits. */
 
@@ -824,8 +825,7 @@ static int setup_cpu_root_pgt(unsigned int cpu)
 
     /* Install direct map page table entries for stack, IDT, and TSS. */
     for ( off = rc = 0; !rc && off < STACK_SIZE; off += PAGE_SIZE )
-        if ( !memguard_is_stack_guard_page(off) )
-            rc = clone_mapping(__va(__pa(stack_base[cpu])) + off, rpt);
+        rc = clone_mapping(__va(__pa(stack_base[cpu])) + off, rpt);
 
     if ( !rc )
         rc = clone_mapping(idt_tables[cpu], rpt);
@@ -858,23 +858,27 @@ static void cleanup_cpu_root_pgt(unsigned int cpu)
           r < root_table_offset(HYPERVISOR_VIRT_END); ++r )
     {
         l3_pgentry_t *l3t;
+        mfn_t l3mfn;
         unsigned int i3;
 
         if ( !(root_get_flags(rpt[r]) & _PAGE_PRESENT) )
             continue;
 
-        l3t = l4e_to_l3e(rpt[r]);
+        l3mfn = l4e_get_mfn(rpt[r]);
+        l3t = map_domain_page(l3mfn);
 
         for ( i3 = 0; i3 < L3_PAGETABLE_ENTRIES; ++i3 )
         {
             l2_pgentry_t *l2t;
+            mfn_t l2mfn;
             unsigned int i2;
 
             if ( !(l3e_get_flags(l3t[i3]) & _PAGE_PRESENT) )
                 continue;
 
             ASSERT(!(l3e_get_flags(l3t[i3]) & _PAGE_PSE));
-            l2t = l3e_to_l2e(l3t[i3]);
+            l2mfn = l3e_get_mfn(l3t[i3]);
+            l2t = map_domain_page(l2mfn);
 
             for ( i2 = 0; i2 < L2_PAGETABLE_ENTRIES; ++i2 )
             {
@@ -882,13 +886,15 @@ static void cleanup_cpu_root_pgt(unsigned int cpu)
                     continue;
 
                 ASSERT(!(l2e_get_flags(l2t[i2]) & _PAGE_PSE));
-                free_xen_pagetable(l2e_to_l1e(l2t[i2]));
+                free_xen_pagetable_new(l2e_get_mfn(l2t[i2]));
             }
 
-            free_xen_pagetable(l2t);
+            unmap_domain_page(l2t);
+            free_xen_pagetable_new(l2mfn);
         }
 
-        free_xen_pagetable(l3t);
+        unmap_domain_page(l3t);
+        free_xen_pagetable_new(l3mfn);
     }
 
     free_xen_pagetable(rpt);
@@ -896,11 +902,14 @@ static void cleanup_cpu_root_pgt(unsigned int cpu)
     /* Also zap the stub mapping for this CPU. */
     if ( stub_linear )
     {
-        l3_pgentry_t *l3t = l4e_to_l3e(common_pgt);
-        l2_pgentry_t *l2t = l3e_to_l2e(l3t[l3_table_offset(stub_linear)]);
-        l1_pgentry_t *l1t = l2e_to_l1e(l2t[l2_table_offset(stub_linear)]);
+        l3_pgentry_t l3e = l3e_from_l4e(common_pgt,
+                                        l3_table_offset(stub_linear));
+        l2_pgentry_t l2e = l2e_from_l3e(l3e, l2_table_offset(stub_linear));
+        l1_pgentry_t *l1t = map_l1t_from_l2e(l2e);
 
         l1t[l1_table_offset(stub_linear)] = l1e_empty();
+
+        unmap_domain_page(l1t);
     }
 }
 
@@ -959,7 +968,8 @@ static void cpu_smpboot_free(unsigned int cpu, bool remove)
             free_domheap_page(mfn_to_page(mfn));
     }
 
-    FREE_XENHEAP_PAGE(per_cpu(compat_gdt, cpu));
+    if ( IS_ENABLED(CONFIG_PV32) )
+        FREE_XENHEAP_PAGE(per_cpu(compat_gdt, cpu));
 
     if ( remove )
     {
@@ -976,6 +986,7 @@ static void cpu_smpboot_free(unsigned int cpu, bool remove)
 
 static int cpu_smpboot_alloc(unsigned int cpu)
 {
+    struct cpu_info *info;
     unsigned int i, memflags = 0;
     nodeid_t node = cpu_to_node(cpu);
     seg_desc_t *gdt;
@@ -989,6 +1000,11 @@ static int cpu_smpboot_alloc(unsigned int cpu)
         stack_base[cpu] = alloc_xenheap_pages(STACK_ORDER, memflags);
     if ( stack_base[cpu] == NULL )
         goto out;
+
+    info = get_cpu_info_from_stack((unsigned long)stack_base[cpu]);
+    info->processor_id = cpu;
+    info->per_cpu_offset = __per_cpu_offset[cpu];
+
     memguard_guard_stack(stack_base[cpu]);
 
     gdt = per_cpu(gdt, cpu) ?: alloc_xenheap_pages(0, memflags);
@@ -1001,6 +1017,7 @@ static int cpu_smpboot_alloc(unsigned int cpu)
     BUILD_BUG_ON(NR_CPUS > 0x10000);
     gdt[PER_CPU_GDT_ENTRY - FIRST_RESERVED_GDT_ENTRY].a = cpu;
 
+#ifdef CONFIG_PV32
     per_cpu(compat_gdt, cpu) = gdt = alloc_xenheap_pages(0, memflags);
     if ( gdt == NULL )
         goto out;
@@ -1008,6 +1025,7 @@ static int cpu_smpboot_alloc(unsigned int cpu)
         l1e_from_pfn(virt_to_mfn(gdt), __PAGE_HYPERVISOR_RW);
     memcpy(gdt, boot_compat_gdt, NR_RESERVED_GDT_PAGES * PAGE_SIZE);
     gdt[PER_CPU_GDT_ENTRY - FIRST_RESERVED_GDT_ENTRY].a = cpu;
+#endif
 
     if ( idt_tables[cpu] == NULL )
         idt_tables[cpu] = alloc_xenheap_pages(0, memflags);
@@ -1166,7 +1184,7 @@ void __init smp_prepare_cpus(void)
     verify_local_APIC();
 
     connect_bsp_APIC();
-    setup_local_APIC();
+    setup_local_APIC(true);
 
     if ( !skip_ioapic_setup && nr_ioapics )
         setup_IO_APIC();

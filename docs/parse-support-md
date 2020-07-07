@@ -232,6 +232,8 @@ sub r_content ($) {
     }
 }
 
+our $pandoc_toplevel_constructor;
+
 sub r_toplevel ($) {
     my ($i) = @_;
 
@@ -241,9 +243,41 @@ sub r_toplevel ($) {
     $had_unknown = undef;
     $had_feature = undef;
 
-    foreach my $e (@$i) {
-        next unless ref $e eq 'ARRAY';
-        r_content $e;
+    # Pandoc's JSON output changed some time between 1.17.2 (stretch)
+    # and 2.2.1 (buster).  I can find no documentation about this
+    # change or about the compatibility rules.  (It seems that
+    # processing the parse tree *is* supported upstream: they offer
+    # many libraries to do this inside the pandoc process.)
+    # Empirically, what has changed is just the top level structure.
+    # Also pandoc wants the same structure back that it spat out,
+    # when we ask it to format snippets.
+
+    my $blocks;
+    if (ref $i eq 'ARRAY') {
+	$pandoc_toplevel_constructor = sub {
+	    my ($blocks) = @_;
+	    return [
+		    { unMeta => { } },
+		    $blocks,
+		   ];
+	};
+	foreach my $e (@$i) {
+	    next unless ref $e eq 'ARRAY';
+	    r_content $e;
+	}
+    } elsif (ref $i eq 'HASH') {
+	my $api_version = $i->{'pandoc-api-version'};
+	$pandoc_toplevel_constructor = sub {
+	    my ($blocks) = @_;
+	    return {
+		    blocks => $blocks,
+		    meta => { },
+		    'pandoc-api-version' => $api_version,
+		   };
+	};
+	r_content $i->{blocks};
+    } else {
+	die;
     }
 }
 
@@ -274,10 +308,10 @@ sub pandoc2html_inline ($) {
     my ($content) = @_;
 
     my $json_fh = IO::File::new_tmpfile or die $!;
-    my $j = to_json([
-                     { unMeta => { } },
-                     [{ t => 'Para', c => $content }],
-                    ]) or die $!;
+
+    my $blocks = [{ t => 'Para', c => $content }];
+    my $data = $pandoc_toplevel_constructor->($blocks);
+    my $j = to_json($data) or die $!;
     print $json_fh $j;
     flush $json_fh or die $!;
     seek $json_fh,0,0 or die $!;

@@ -35,10 +35,10 @@ static int read_headers(struct xc_sr_context *ctx)
         return -1;
     }
 
-    if ( ihdr.version != IHDR_VERSION )
+    if ( ihdr.version < 2 || ihdr.version > 3 )
     {
-        ERROR("Invalid Version: Expected %d, Got %d",
-              IHDR_VERSION, ihdr.version);
+        ERROR("Invalid Version: Expected 2 <= ver <= 3, Got %d",
+              ihdr.version);
         return -1;
     }
 
@@ -342,6 +342,31 @@ static int handle_page_data(struct xc_sr_context *ctx, struct xc_sr_record *rec)
     xen_pfn_t *pfns = NULL, pfn;
     uint32_t *types = NULL, type;
 
+    /*
+     * v2 compatibility only exists for x86 streams.  This is a bit of a
+     * bodge, but it is less bad than duplicating handle_page_data() between
+     * different architectures.
+     */
+#if defined(__i386__) || defined(__x86_64__)
+    /* v2 compat.  Infer the position of STATIC_DATA_END. */
+    if ( ctx->restore.format_version < 3 && !ctx->restore.seen_static_data_end )
+    {
+        rc = handle_static_data_end(ctx);
+        if ( rc )
+        {
+            ERROR("Inferred STATIC_DATA_END record failed");
+            goto err;
+        }
+        rc = -1;
+    }
+
+    if ( !ctx->restore.seen_static_data_end )
+    {
+        ERROR("No STATIC_DATA_END seen");
+        goto err;
+    }
+#endif
+
     if ( rec->length < sizeof(*pages) )
     {
         ERROR("PAGE_DATA record truncated: length %u, min %zu",
@@ -631,6 +656,32 @@ static int buffer_record(struct xc_sr_context *ctx, struct xc_sr_record *rec)
     return 0;
 }
 
+int handle_static_data_end(struct xc_sr_context *ctx)
+{
+    xc_interface *xch = ctx->xch;
+    unsigned int missing = 0;
+    int rc = 0;
+
+    if ( ctx->restore.seen_static_data_end )
+    {
+        ERROR("Multiple STATIC_DATA_END records found");
+        return -1;
+    }
+
+    ctx->restore.seen_static_data_end = true;
+
+    rc = ctx->restore.ops.static_data_complete(ctx, &missing);
+    if ( rc )
+        return rc;
+
+    if ( ctx->restore.callbacks->static_data_done &&
+         (rc = ctx->restore.callbacks->static_data_done(
+             missing, ctx->restore.callbacks->data) != 0) )
+        ERROR("static_data_done() callback failed: %d\n", rc);
+
+    return rc;
+}
+
 static int process_record(struct xc_sr_context *ctx, struct xc_sr_record *rec)
 {
     xc_interface *xch = ctx->xch;
@@ -652,6 +703,10 @@ static int process_record(struct xc_sr_context *ctx, struct xc_sr_record *rec)
 
     case REC_TYPE_CHECKPOINT:
         rc = handle_checkpoint(ctx);
+        break;
+
+    case REC_TYPE_STATIC_DATA_END:
+        rc = handle_static_data_end(ctx);
         break;
 
     default:

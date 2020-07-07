@@ -128,11 +128,6 @@ SECTIONS
        *(.ex_table.pre)
        __stop___pre_ex_table = .;
 
-       . = ALIGN(POINTER_ALIGN);
-       __param_start = .;
-       *(.data.param)
-       __param_end = .;
-
 #if defined(CONFIG_HAS_VPCI) && defined(CONFIG_LATE_HWDOM)
        . = ALIGN(POINTER_ALIGN);
        __start_vpci_array = .;
@@ -279,6 +274,13 @@ SECTIONS
        __start_schedulers_array = .;
        *(.data.schedulers)
        __end_schedulers_array = .;
+
+#ifdef CONFIG_HYPFS
+       . = ALIGN(8);
+       __paramhypfs_start = .;
+       *(.data.paramhypfs)
+       __paramhypfs_end = .;
+#endif
   } :text
 
   DECL_SECTION(.data) {
@@ -327,7 +329,7 @@ SECTIONS
 #endif
 
 #ifdef CONFIG_HYPERV_GUEST
-  hv_hcall_page = ABSOLUTE(HV_HCALL_PAGE);
+  hv_hcall_page = ABSOLUTE(HV_HCALL_PAGE - XEN_VIRT_START + __XEN_VIRT_START);
 #endif
 
   /* Sections to be discarded */

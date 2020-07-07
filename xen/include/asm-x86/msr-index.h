@@ -66,6 +66,32 @@
 #define  TSX_CTRL_RTM_DISABLE               (_AC(1, ULL) <<  0)
 #define  TSX_CTRL_CPUID_CLEAR               (_AC(1, ULL) <<  1)
 
+#define MSR_MCU_OPT_CTRL                    0x00000123
+#define  MCU_OPT_CTRL_RNGDS_MITG_DIS        (_AC(1, ULL) <<  0)
+
+#define MSR_RTIT_OUTPUT_BASE                0x00000560
+#define MSR_RTIT_OUTPUT_MASK                0x00000561
+#define MSR_RTIT_CTL                        0x00000570
+#define MSR_RTIT_STATUS                     0x00000571
+#define MSR_RTIT_CR3_MATCH                  0x00000572
+#define MSR_RTIT_ADDR_A(n)                 (0x00000580 + (n) * 2)
+#define MSR_RTIT_ADDR_B(n)                 (0x00000581 + (n) * 2)
+
+#define MSR_U_CET                           0x000006a0
+#define MSR_S_CET                           0x000006a2
+#define  CET_SHSTK_EN                       (_AC(1, ULL) <<  0)
+#define  CET_WRSS_EN                        (_AC(1, ULL) <<  1)
+
+#define MSR_PL0_SSP                         0x000006a4
+#define MSR_PL1_SSP                         0x000006a5
+#define MSR_PL2_SSP                         0x000006a6
+#define MSR_PL3_SSP                         0x000006a7
+#define MSR_INTERRUPT_SSP_TABLE             0x000006a8
+
+#define MSR_PASID                           0x00000d93
+#define  PASID_PASID_MASK                   0x000fffff
+#define  PASID_VALID                        (_AC(1, ULL) << 31)
+
 /*
  * Legacy MSR constants in need of cleanup.  No new MSRs below this comment.
  */

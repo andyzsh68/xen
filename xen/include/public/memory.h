@@ -396,10 +396,10 @@ struct xen_mem_paging_op {
     uint8_t     op;         /* XENMEM_paging_op_* */
     domid_t     domain;
 
-    /* PAGING_PREP IN: buffer to immediately fill page in */
-    uint64_aligned_t    buffer;
-    /* Other OPs */
-    uint64_aligned_t    gfn;           /* IN:  gfn of page being operated on */
+    /* IN: (XENMEM_paging_op_prep) buffer to immediately fill page from */
+    XEN_GUEST_HANDLE_64(const_uint8) buffer;
+    /* IN:  gfn of page being operated on */
+    uint64_aligned_t    gfn;
 };
 typedef struct xen_mem_paging_op xen_mem_paging_op_t;
 DEFINE_XEN_GUEST_HANDLE(xen_mem_paging_op_t);
@@ -536,7 +536,12 @@ struct xen_mem_sharing_op {
         } debug;
         struct mem_sharing_op_fork {      /* OP_FORK */
             domid_t parent_domain;        /* IN: parent's domain id */
-            uint16_t pad[3];              /* Must be set to 0 */
+/* Only makes sense for short-lived forks */
+#define XENMEM_FORK_WITH_IOMMU_ALLOWED (1u << 0)
+/* Only makes sense for short-lived forks */
+#define XENMEM_FORK_BLOCK_INTERRUPTS   (1u << 1)
+            uint16_t flags;               /* IN: optional settings */
+            uint32_t pad;                 /* Must be set to 0 */
         } fork;
     } u;
 };
@@ -605,6 +610,8 @@ struct xen_reserved_device_memory_map {
 typedef struct xen_reserved_device_memory_map xen_reserved_device_memory_map_t;
 DEFINE_XEN_GUEST_HANDLE(xen_reserved_device_memory_map_t);
 
+#endif /* defined(__XEN__) || defined(__XEN_TOOLS__) */
+
 /*
  * Get the pages for a particular guest resource, so that they can be
  * mapped directly by a tools domain.
@@ -643,7 +650,7 @@ struct xen_mem_acquire_resource {
      * IN - the index of the initial frame to be mapped. This parameter
      *      is ignored if nr_frames is 0.
      */
-    uint64_aligned_t frame;
+    uint64_t frame;
 
 #define XENMEM_resource_ioreq_server_frame_bufioreq 0
 #define XENMEM_resource_ioreq_server_frame_ioreq(n) (1 + (n))
@@ -663,8 +670,6 @@ struct xen_mem_acquire_resource {
 };
 typedef struct xen_mem_acquire_resource xen_mem_acquire_resource_t;
 DEFINE_XEN_GUEST_HANDLE(xen_mem_acquire_resource_t);
-
-#endif /* defined(__XEN__) || defined(__XEN_TOOLS__) */
 
 /*
  * XENMEM_get_vnumainfo used by guest to get

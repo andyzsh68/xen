@@ -1,6 +1,7 @@
 #ifndef _XEN_PARAM_H
 #define _XEN_PARAM_H
 
+#include <xen/hypfs.h>
 #include <xen/init.h>
 #include <xen/lib.h>
 #include <xen/stdbool.h>
@@ -26,9 +27,6 @@ struct kernel_param {
 };
 
 extern const struct kernel_param __setup_start[], __setup_end[];
-extern const struct kernel_param __param_start[], __param_end[];
-
-#define __dataparam       __used_section(".data.param")
 
 #define __param(att)      static const att \
     __attribute__((__aligned__(sizeof(void *)))) struct kernel_param
@@ -78,42 +76,98 @@ extern const struct kernel_param __param_start[], __param_end[];
         { .name = setup_str_ign,            \
           .type = OPT_IGNORE }
 
-#define __rtparam         __param(__dataparam)
+#ifdef CONFIG_HYPFS
 
-#define custom_runtime_only_param(_name, _var) \
-    __rtparam __rtpar_##_var = \
-      { .name = _name, \
-          .type = OPT_CUSTOM, \
-          .par.func = _var }
-#define boolean_runtime_only_param(_name, _var) \
-    __rtparam __rtpar_##_var = \
-        { .name = _name, \
-          .type = OPT_BOOL, \
-          .len = sizeof(_var) + \
-                 BUILD_BUG_ON_ZERO(sizeof(_var) != sizeof(bool)), \
-          .par.var = &_var }
-#define integer_runtime_only_param(_name, _var) \
-    __rtparam __rtpar_##_var = \
-        { .name = _name, \
-          .type = OPT_UINT, \
-          .len = sizeof(_var), \
-          .par.var = &_var }
-#define size_runtime_only_param(_name, _var) \
-    __rtparam __rtpar_##_var = \
-        { .name = _name, \
-          .type = OPT_SIZE, \
-          .len = sizeof(_var), \
-          .par.var = &_var }
-#define string_runtime_only_param(_name, _var) \
-    __rtparam __rtpar_##_var = \
-        { .name = _name, \
-          .type = OPT_STR, \
-          .len = sizeof(_var), \
-          .par.var = &_var }
+struct param_hypfs {
+    struct hypfs_entry_leaf hypfs;
+    void (*init_leaf)(struct param_hypfs *par);
+    int (*func)(const char *);
+};
 
-#define custom_runtime_param(_name, _var) \
+extern struct param_hypfs __paramhypfs_start[], __paramhypfs_end[];
+
+#define __paramhypfs      __used_section(".data.paramhypfs")
+
+#define __paramfs         static __paramhypfs  \
+    __attribute__((__aligned__(sizeof(void *)))) struct param_hypfs
+
+#define custom_runtime_set_var_sz(parfs, var, sz) \
+    { \
+        (parfs)->hypfs.u.content = var; \
+        (parfs)->hypfs.e.max_size = sz; \
+        (parfs)->hypfs.e.size = strlen(var) + 1; \
+    }
+#define custom_runtime_set_var(parfs, var) \
+    custom_runtime_set_var_sz(parfs, var, sizeof(var))
+
+#define param_2_parfs(par) &__parfs_##par
+
+/* initfunc needs to set size and content, e.g. via custom_runtime_set_var(). */
+#define custom_runtime_only_param(nam, variable, initfunc) \
+    __paramfs __parfs_##variable = \
+        { .hypfs.e.type = XEN_HYPFS_TYPE_STRING, \
+          .hypfs.e.encoding = XEN_HYPFS_ENC_PLAIN, \
+          .hypfs.e.name = (nam), \
+          .hypfs.e.read = hypfs_read_leaf, \
+          .hypfs.e.write = hypfs_write_custom, \
+          .init_leaf = (initfunc), \
+          .func = (variable) }
+#define boolean_runtime_only_param(nam, variable) \
+    __paramfs __parfs_##variable = \
+        { .hypfs.e.type = XEN_HYPFS_TYPE_BOOL, \
+          .hypfs.e.encoding = XEN_HYPFS_ENC_PLAIN, \
+          .hypfs.e.name = (nam), \
+          .hypfs.e.size = sizeof(variable), \
+          .hypfs.e.max_size = sizeof(variable), \
+          .hypfs.e.read = hypfs_read_leaf, \
+          .hypfs.e.write = hypfs_write_bool, \
+          .hypfs.u.content = &(variable) }
+#define integer_runtime_only_param(nam, variable) \
+    __paramfs __parfs_##variable = \
+        { .hypfs.e.type = XEN_HYPFS_TYPE_UINT, \
+          .hypfs.e.encoding = XEN_HYPFS_ENC_PLAIN, \
+          .hypfs.e.name = (nam), \
+          .hypfs.e.size = sizeof(variable), \
+          .hypfs.e.max_size = sizeof(variable), \
+          .hypfs.e.read = hypfs_read_leaf, \
+          .hypfs.e.write = hypfs_write_leaf, \
+          .hypfs.u.content = &(variable) }
+#define size_runtime_only_param(nam, variable) \
+    __paramfs __parfs_##variable = \
+        { .hypfs.e.type = XEN_HYPFS_TYPE_UINT, \
+          .hypfs.e.encoding = XEN_HYPFS_ENC_PLAIN, \
+          .hypfs.e.name = (nam), \
+          .hypfs.e.size = sizeof(variable), \
+          .hypfs.e.max_size = sizeof(variable), \
+          .hypfs.e.read = hypfs_read_leaf, \
+          .hypfs.e.write = hypfs_write_leaf, \
+          .hypfs.u.content = &(variable) }
+#define string_runtime_only_param(nam, variable) \
+    __paramfs __parfs_##variable = \
+        { .hypfs.e.type = XEN_HYPFS_TYPE_STRING, \
+          .hypfs.e.encoding = XEN_HYPFS_ENC_PLAIN, \
+          .hypfs.e.name = (nam), \
+          .hypfs.e.size = 0, \
+          .hypfs.e.max_size = sizeof(variable), \
+          .hypfs.e.read = hypfs_read_leaf, \
+          .hypfs.e.write = hypfs_write_leaf, \
+          .hypfs.u.content = &(variable) }
+
+#else
+
+#define custom_runtime_only_param(nam, var, initfunc)
+#define boolean_runtime_only_param(nam, var)
+#define integer_runtime_only_param(nam, var)
+#define size_runtime_only_param(nam, var)
+#define string_runtime_only_param(nam, var)
+
+#define custom_runtime_set_var(parfs, var)
+
+#endif
+
+#define custom_runtime_param(_name, _var, initfunc) \
     custom_param(_name, _var); \
-    custom_runtime_only_param(_name, _var)
+    custom_runtime_only_param(_name, _var, initfunc)
 #define boolean_runtime_param(_name, _var) \
     boolean_param(_name, _var); \
     boolean_runtime_only_param(_name, _var)
@@ -126,5 +180,14 @@ extern const struct kernel_param __param_start[], __param_end[];
 #define string_runtime_param(_name, _var) \
     string_param(_name, _var); \
     string_runtime_only_param(_name, _var)
+
+static inline void no_config_param(const char *cfg, const char *param,
+                                   const char *s, const char *e)
+{
+    int len = e ? ({ ASSERT(e >= s); e - s; }) : strlen(s);
+
+    printk(XENLOG_INFO "CONFIG_%s disabled - ignoring '%s=%*s' setting\n",
+           cfg, param, len, s);
+}
 
 #endif /* _XEN_PARAM_H */

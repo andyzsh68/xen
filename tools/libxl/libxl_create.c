@@ -172,12 +172,37 @@ int libxl__domain_build_info_setdefault(libxl__gc *gc,
     }
 
     if (b_info->type == LIBXL_DOMAIN_TYPE_HVM &&
-        b_info->device_model_version !=
-            LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN_TRADITIONAL &&
         libxl_defbool_val(b_info->device_model_stubdomain)) {
-        LOG(ERROR,
-            "device model stubdomains require \"qemu-xen-traditional\"");
-        return ERROR_INVAL;
+        if (!b_info->stubdomain_kernel) {
+            switch (b_info->device_model_version) {
+                case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN_TRADITIONAL:
+                    b_info->stubdomain_kernel =
+                        libxl__abs_path(NOGC, "ioemu-stubdom.gz", libxl__xenfirmwaredir_path());
+                    break;
+                case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN:
+                    b_info->stubdomain_kernel =
+                        libxl__abs_path(NOGC,
+                                "qemu-stubdom-linux-kernel",
+                                libxl__xenfirmwaredir_path());
+                    break;
+                default:
+                    abort();
+            }
+        }
+        if (!b_info->stubdomain_ramdisk) {
+            switch (b_info->device_model_version) {
+                case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN_TRADITIONAL:
+                    break;
+                case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN:
+                    b_info->stubdomain_ramdisk =
+                        libxl__abs_path(NOGC,
+                                "qemu-stubdom-linux-rootfs",
+                                libxl__xenfirmwaredir_path());
+                    break;
+                default:
+                    abort();
+            }
+        }
     }
 
     if (!b_info->max_vcpus)
@@ -214,6 +239,17 @@ int libxl__domain_build_info_setdefault(libxl__gc *gc,
         b_info->max_memkb = 32 * 1024;
     if (b_info->target_memkb == LIBXL_MEMKB_DEFAULT)
         b_info->target_memkb = b_info->max_memkb;
+
+    if (b_info->stubdomain_memkb == LIBXL_MEMKB_DEFAULT) {
+        if (libxl_defbool_val(b_info->device_model_stubdomain)) {
+            if (libxl__stubdomain_is_linux(b_info))
+                b_info->stubdomain_memkb = LIBXL_LINUX_STUBDOM_MEM * 1024;
+            else
+                b_info->stubdomain_memkb = 28 * 1024; // MiniOS
+        } else {
+            b_info->stubdomain_memkb = 0; // no stubdomain
+        }
+    }
 
     libxl_defbool_setdefault(&b_info->claim_mode, false);
 
@@ -1181,18 +1217,18 @@ static void initiate_domain_create(libxl__egc *egc,
 
     /* convenience aliases */
     libxl_domain_config *const d_config = dcs->guest_config;
-    const int restore_fd = dcs->restore_fd;
+    libxl__domain_build_state *dbs = &dcs->build_state;
 
     libxl__xswait_init(&dcs->console_xswait);
 
     domid = dcs->domid;
-    libxl__domain_build_state_init(&dcs->build_state);
+    libxl__domain_build_state_init(dbs);
+    dbs->restore = dcs->restore_fd >= 0;
 
     ret = libxl__domain_config_setdefault(gc,d_config,domid);
     if (ret) goto error_out;
 
-    ret = libxl__domain_make(gc, d_config, &dcs->build_state, &domid,
-                             dcs->soft_reset);
+    ret = libxl__domain_make(gc, d_config, dbs, &domid, dcs->soft_reset);
     if (ret) {
         LOGD(ERROR, domid, "cannot make domain: %d", ret);
         dcs->guest_domid = domid;
@@ -1236,7 +1272,7 @@ static void initiate_domain_create(libxl__egc *egc,
     if (ret)
         goto error_out;
 
-    if (restore_fd >= 0 || dcs->soft_reset) {
+    if (dbs->restore || dcs->soft_reset) {
         LOGD(DEBUG, domid, "restoring, not running bootloader");
         domcreate_bootloader_done(egc, &dcs->bl, 0);
     } else  {
@@ -1247,8 +1283,8 @@ static void initiate_domain_create(libxl__egc *egc,
         dcs->bl.disk = bootdisk;
         dcs->bl.domid = dcs->guest_domid;
 
-        dcs->bl.kernel = &dcs->build_state.pv_kernel;
-        dcs->bl.ramdisk = &dcs->build_state.pv_ramdisk;
+        dcs->bl.kernel = &dbs->pv_kernel;
+        dcs->bl.ramdisk = &dbs->pv_ramdisk;
 
         libxl__bootloader_run(egc, &dcs->bl);
     }
@@ -1322,6 +1358,7 @@ static void domcreate_bootloader_done(libxl__egc *egc,
     dcs->srs.dcs = dcs;
 
     /* Restore */
+    callbacks->static_data_done = libxl__srm_callout_callback_static_data_done;
     callbacks->restore_results = libxl__srm_callout_callback_restore_results;
 
     /* COLO only supports HVM now because it does not work very
@@ -1389,6 +1426,30 @@ static void libxl__colo_restore_setup_done(libxl__egc *egc,
     }
 
     libxl__stream_read_start(egc, &dcs->srs);
+}
+
+int libxl__srm_callout_callback_static_data_done(unsigned int missing,
+                                                 void *user)
+{
+    libxl__save_helper_state *shs = user;
+    libxl__domain_create_state *dcs = shs->caller_state;
+    STATE_AO_GC(dcs->ao);
+    libxl_ctx *ctx = libxl__gc_owner(gc);
+
+    libxl_domain_config *d_config = dcs->guest_config;
+    libxl_domain_build_info *info = &d_config->b_info;
+
+    /*
+     * CPUID/MSR information is not present in pre Xen-4.14 streams.
+     *
+     * Libxl used to always regenerate the CPUID policy from first principles
+     * on migrate.  Continue to do so for backwards compatibility when the
+     * stream doesn't contain any CPUID data.
+     */
+    if (missing & XGR_SDD_MISSING_CPUID)
+        libxl__cpuid_legacy(ctx, dcs->guest_domid, true, info);
+
+    return 0;
 }
 
 void libxl__srm_callout_callback_restore_results(xen_pfn_t store_mfn,

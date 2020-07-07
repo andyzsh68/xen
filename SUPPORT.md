@@ -9,7 +9,7 @@ for the definitions of the support status levels etc.
 
 # Release Support
 
-    Xen-Version: 4.14-unstable
+    Xen-Version: 4.14-rc
     Initial-Release: n/a
     Supported-Until: TBD
     Security-Support-Until: Unreleased - not yet security-supported
@@ -109,6 +109,20 @@ ARM only has one guest type at the moment
 
     Status: Supported
 
+## Hypervisor file system
+
+### Build info
+
+    Status: Supported
+
+### Hypervisor config
+
+    Status: Supported
+
+### Runtime parameters
+
+    Status: Supported
+
 ## Toolstack
 
 ### xl
@@ -146,6 +160,12 @@ Output of information in machine-parseable JSON format
 ### QEMU backend hotplugging for xl
 
     Status: Supported
+
+### xenlight Go package
+
+Go (golang) bindings for libxl
+
+    Status: Experimental
 
 ## Toolstack/3rd party
 

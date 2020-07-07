@@ -652,6 +652,18 @@ static int cmpxchg(
     return X86EMUL_OKAY;
 }
 
+static int blk(
+    enum x86_segment seg,
+    unsigned long offset,
+    void *p_data,
+    unsigned int bytes,
+    uint32_t *eflags,
+    struct x86_emulate_state *state,
+    struct x86_emulate_ctxt *ctxt)
+{
+    return x86_emul_blk((void *)offset, p_data, bytes, eflags, state, ctxt);
+}
+
 static int read_segment(
     enum x86_segment seg,
     struct segment_register *reg,
@@ -721,6 +733,7 @@ static struct x86_emulate_ops emulops = {
     .insn_fetch = fetch,
     .write      = write,
     .cmpxchg    = cmpxchg,
+    .blk        = blk,
     .read_segment = read_segment,
     .cpuid      = emul_test_cpuid,
     .read_cr    = emul_test_read_cr,
@@ -734,6 +747,31 @@ static struct x86_emulate_ops emulops = {
 #define EFLAGS_MASK (X86_EFLAGS_ARITH_MASK | EFLAGS_ALWAYS_SET)
 
 #define MMAP_ADDR 0x100000
+
+/*
+ * 64-bit OSes may not (be able to) properly restore the two selectors in
+ * the FPU environment. Zap them so that memcmp() on two saved images will
+ * work regardless of whether a context switch occurred in the middle.
+ */
+static void zap_fpsel(unsigned int *env, bool is_32bit)
+{
+    if ( is_32bit )
+    {
+        env[4] &= ~0xffff;
+        env[6] &= ~0xffff;
+    }
+    else
+    {
+        env[2] &= ~0xffff;
+        env[3] &= ~0xffff;
+    }
+}
+
+static void zap_xfpsel(unsigned int *env)
+{
+    env[3] &= ~0xffff;
+    env[5] &= ~0xffff;
+}
 
 #ifdef __x86_64__
 # define STKVAL_DISP 64
@@ -2338,6 +2376,237 @@ int main(int argc, char **argv)
          (regs.eip != (unsigned long)&instr[4]) )
         goto fail;
     printf("okay\n");
+
+    printf("%-40s", "Testing movdiri %edx,(%ecx)...");
+    if ( stack_exec && cpu_has_movdiri )
+    {
+        instr[0] = 0x0f; instr[1] = 0x38; instr[2] = 0xf9; instr[3] = 0x11;
+
+        regs.eip = (unsigned long)&instr[0];
+        regs.ecx = (unsigned long)memset(res, -1, 16);
+        regs.edx = 0x44332211;
+
+        rc = x86_emulate(&ctxt, &emulops);
+        if ( (rc != X86EMUL_OKAY) ||
+             (regs.eip != (unsigned long)&instr[4]) ||
+             res[0] != 0x44332211 || ~res[1] )
+            goto fail;
+        printf("okay\n");
+    }
+    else
+        printf("skipped\n");
+
+    printf("%-40s", "Testing movdir64b 144(%edx),%ecx...");
+    if ( stack_exec && cpu_has_movdir64b )
+    {
+        instr[0] = 0x66; instr[1] = 0x0f; instr[2] = 0x38; instr[3] = 0xf8;
+        instr[4] = 0x8a; instr[5] = 0x90; instr[8] = instr[7] = instr[6] = 0;
+
+        regs.eip = (unsigned long)&instr[0];
+        for ( i = 0; i < 64; ++i )
+            res[i] = i - 20;
+        regs.edx = (unsigned long)res;
+        regs.ecx = (unsigned long)(res + 16);
+
+        rc = x86_emulate(&ctxt, &emulops);
+        if ( (rc != X86EMUL_OKAY) ||
+             (regs.eip != (unsigned long)&instr[9]) ||
+             res[15] != -5 || res[32] != 12 )
+            goto fail;
+        for ( i = 16; i < 32; ++i )
+            if ( res[i] != i )
+                goto fail;
+        printf("okay\n");
+    }
+    else
+        printf("skipped\n");
+
+    printf("%-40s", "Testing fnstenv 4(%ecx)...");
+    if ( stack_exec && cpu_has_fpu )
+    {
+        const uint16_t three = 3;
+
+        asm volatile ( "fninit\n\t"
+                       "fld1\n\t"
+                       "fidivs %1\n\t"
+                       "fstenv %0"
+                       : "=m" (res[9]) : "m" (three) : "memory" );
+        zap_fpsel(&res[9], true);
+        instr[0] = 0xd9; instr[1] = 0x71; instr[2] = 0x04;
+        regs.eip = (unsigned long)&instr[0];
+        regs.ecx = (unsigned long)res;
+        res[8] = 0xaa55aa55;
+        rc = x86_emulate(&ctxt, &emulops);
+        zap_fpsel(&res[1], true);
+        if ( (rc != X86EMUL_OKAY) ||
+             memcmp(res + 1, res + 9, 28) ||
+             res[8] != 0xaa55aa55 ||
+             (regs.eip != (unsigned long)&instr[3]) )
+            goto fail;
+        printf("okay\n");
+    }
+    else
+        printf("skipped\n");
+
+    printf("%-40s", "Testing fldenv 8(%edx)...");
+    if ( stack_exec && cpu_has_fpu )
+    {
+        asm volatile ( "fnstenv %0\n\t"
+                       "fninit"
+                       : "=m" (res[2]) :: "memory" );
+        zap_fpsel(&res[2], true);
+        instr[0] = 0xd9; instr[1] = 0x62; instr[2] = 0x08;
+        regs.eip = (unsigned long)&instr[0];
+        regs.edx = (unsigned long)res;
+        rc = x86_emulate(&ctxt, &emulops);
+        asm volatile ( "fnstenv %0" : "=m" (res[9]) :: "memory" );
+        if ( (rc != X86EMUL_OKAY) ||
+             memcmp(res + 2, res + 9, 28) ||
+             (regs.eip != (unsigned long)&instr[3]) )
+            goto fail;
+        printf("okay\n");
+    }
+    else
+        printf("skipped\n");
+
+    printf("%-40s", "Testing 16-bit fnsave (%ecx)...");
+    if ( stack_exec && cpu_has_fpu )
+    {
+        const uint16_t five = 5;
+
+        asm volatile ( "fninit\n\t"
+                       "fld1\n\t"
+                       "fidivs %1\n\t"
+                       "fsaves %0"
+                       : "=m" (res[25]) : "m" (five) : "memory" );
+        zap_fpsel(&res[25], false);
+        asm volatile ( "frstors %0" :: "m" (res[25]) : "memory" );
+        instr[0] = 0x66; instr[1] = 0xdd; instr[2] = 0x31;
+        regs.eip = (unsigned long)&instr[0];
+        regs.ecx = (unsigned long)res;
+        res[23] = 0xaa55aa55;
+        res[24] = 0xaa55aa55;
+        rc = x86_emulate(&ctxt, &emulops);
+        if ( (rc != X86EMUL_OKAY) ||
+             memcmp(res, res + 25, 94) ||
+             (res[23] >> 16) != 0xaa55 ||
+             res[24] != 0xaa55aa55 ||
+             (regs.eip != (unsigned long)&instr[3]) )
+            goto fail;
+        printf("okay\n");
+    }
+    else
+        printf("skipped\n");
+
+    printf("%-40s", "Testing frstor (%edx)...");
+    if ( stack_exec && cpu_has_fpu )
+    {
+        const uint16_t seven = 7;
+
+        asm volatile ( "fninit\n\t"
+                       "fld1\n\t"
+                       "fidivs %1\n\t"
+                       "fnsave %0\n\t"
+                       : "=&m" (res[0]) : "m" (seven) : "memory" );
+        zap_fpsel(&res[0], true);
+        instr[0] = 0xdd; instr[1] = 0x22;
+        regs.eip = (unsigned long)&instr[0];
+        regs.edx = (unsigned long)res;
+        rc = x86_emulate(&ctxt, &emulops);
+        asm volatile ( "fnsave %0" : "=m" (res[27]) :: "memory" );
+        if ( (rc != X86EMUL_OKAY) ||
+             memcmp(res, res + 27, 108) ||
+             (regs.eip != (unsigned long)&instr[2]) )
+            goto fail;
+        printf("okay\n");
+    }
+    else
+        printf("skipped\n");
+
+    printf("%-40s", "Testing fxsave 4(%ecx)...");
+    if ( stack_exec && cpu_has_fxsr )
+    {
+        const uint16_t nine = 9;
+
+        memset(res + 0x80, 0xcc, 0x400);
+        if ( cpu_has_sse2 )
+            asm volatile ( "pcmpeqd %xmm7, %xmm7\n\t"
+                           "pxor %xmm6, %xmm6\n\t"
+                           "psubw %xmm7, %xmm6" );
+        asm volatile ( "fninit\n\t"
+                       "fld1\n\t"
+                       "fidivs %1\n\t"
+                       "fxsave %0"
+                       : "=m" (res[0x100]) : "m" (nine) : "memory" );
+        zap_xfpsel(&res[0x100]);
+        instr[0] = 0x0f; instr[1] = 0xae; instr[2] = 0x41; instr[3] = 0x04;
+        regs.eip = (unsigned long)&instr[0];
+        regs.ecx = (unsigned long)(res + 0x7f);
+        memset(res + 0x100 + 0x74, 0x33, 0x30);
+        memset(res + 0x80 + 0x74, 0x33, 0x30);
+        rc = x86_emulate(&ctxt, &emulops);
+        zap_xfpsel(&res[0x80]);
+        if ( (rc != X86EMUL_OKAY) ||
+             memcmp(res + 0x80, res + 0x100, 0x200) ||
+             (regs.eip != (unsigned long)&instr[4]) )
+            goto fail;
+        printf("okay\n");
+    }
+    else
+        printf("skipped\n");
+
+    printf("%-40s", "Testing fxrstor -4(%ecx)...");
+    if ( stack_exec && cpu_has_fxsr )
+    {
+        const uint16_t eleven = 11;
+
+        memset(res + 0x80, 0xcc, 0x400);
+        asm volatile ( "fxsave %0" : "=m" (res[0x80]) :: "memory" );
+        zap_xfpsel(&res[0x80]);
+        if ( cpu_has_sse2 )
+            asm volatile ( "pxor %xmm7, %xmm6\n\t"
+                           "pxor %xmm7, %xmm3\n\t"
+                           "pxor %xmm7, %xmm0\n\t"
+                           "pxor %xmm7, %xmm7" );
+        asm volatile ( "fninit\n\t"
+                       "fld1\n\t"
+                       "fidivs %0\n\t"
+                       :: "m" (eleven) );
+        instr[0] = 0x0f; instr[1] = 0xae; instr[2] = 0x49; instr[3] = 0xfc;
+        regs.eip = (unsigned long)&instr[0];
+        regs.ecx = (unsigned long)(res + 0x81);
+        rc = x86_emulate(&ctxt, &emulops);
+        asm volatile ( "fxsave %0" : "=m" (res[0x100]) :: "memory" );
+        if ( (rc != X86EMUL_OKAY) ||
+             memcmp(res + 0x100, res + 0x80, 0x200) ||
+             (regs.eip != (unsigned long)&instr[4]) )
+            goto fail;
+        printf("okay\n");
+    }
+    else
+        printf("skipped\n");
+
+#ifdef __x86_64__
+    printf("%-40s", "Testing fxsaveq 8(%edx)...");
+    if ( stack_exec && cpu_has_fxsr )
+    {
+        memset(res + 0x80, 0xcc, 0x400);
+        asm volatile ( "fxsaveq %0" : "=m" (res[0x100]) :: "memory" );
+        instr[0] = 0x48; instr[1] = 0x0f; instr[2] = 0xae; instr[3] = 0x42; instr[4] = 0x08;
+        regs.eip = (unsigned long)&instr[0];
+        regs.edx = (unsigned long)(res + 0x7e);
+        memset(res + 0x100 + 0x74, 0x33, 0x30);
+        memset(res + 0x80 + 0x74, 0x33, 0x30);
+        rc = x86_emulate(&ctxt, &emulops);
+        if ( (rc != X86EMUL_OKAY) ||
+             memcmp(res + 0x80, res + 0x100, 0x200) ||
+             (regs.eip != (unsigned long)&instr[5]) )
+            goto fail;
+        printf("okay\n");
+    }
+    else
+        printf("skipped\n");
+#endif
 
     printf("%-40s", "Testing movq %mm3,(%ecx)...");
     if ( stack_exec && cpu_has_mmx )
@@ -4809,6 +5078,8 @@ int main(int argc, char **argv)
 
     if ( stack_exec )
         evex_disp8_test(instr, &ctxt, &emulops);
+
+    predicates_test(instr, &ctxt, fetch);
 
     for ( j = 0; j < ARRAY_SIZE(blobs); j++ )
     {
