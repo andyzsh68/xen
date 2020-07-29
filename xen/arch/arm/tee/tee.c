@@ -33,7 +33,7 @@ static const struct tee_mediator_desc __read_mostly *cur_mediator;
 bool tee_handle_call(struct cpu_user_regs *regs)
 {
     if ( unlikely(!cur_mediator) ) {
-        printk(XENLOG_INFO "%s- Fuck mediator\n", __func__);
+        printk(XENLOG_INFO "%s- Null mediator\n", __func__);
         return false;
     }
 

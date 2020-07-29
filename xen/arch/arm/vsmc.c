@@ -279,6 +279,7 @@ static bool vsmccc_handle_call(struct cpu_user_regs *regs)
             break;
         case ARM_SMCCC_OWNER_TRUSTED_APP ... ARM_SMCCC_OWNER_TRUSTED_APP_END:
         case ARM_SMCCC_OWNER_TRUSTED_OS ... ARM_SMCCC_OWNER_TRUSTED_OS_END:
+            gprintk(XENLOG_INFO, "%s-%d hsr.ec: %d, funcid: %x\n", __func__, __LINE__, hsr.ec, funcid);
             handled = tee_handle_call(regs);
             break;
         }

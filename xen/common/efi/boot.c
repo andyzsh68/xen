@@ -1153,6 +1153,7 @@ efi_start(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     char *option_str;
     bool use_cfg_file;
 
+
     __set_bit(EFI_BOOT, &efi_flags);
     __set_bit(EFI_LOADER, &efi_flags);
 
@@ -1169,6 +1170,7 @@ efi_start(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     if ( status != EFI_SUCCESS )
         PrintErrMesg(L"No Loaded Image Protocol", status);
 
+    PrintStr(L"Xen EFI Loader Entry\r\n");
     efi_arch_load_addr_check(loaded_image);
 
     if ( use_cfg_file )
