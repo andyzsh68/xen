@@ -209,8 +209,10 @@ static bool optee_probe(void)
      * OP-TEE have no virtualization support enabled.
      */
     arm_smccc_smc(OPTEE_SMC_VM_DESTROYED, 0, 0, 0, 0, 0, 0, 0, &resp);
-    if ( resp.a0 == OPTEE_SMC_RETURN_UNKNOWN_FUNCTION )
+    if ( resp.a0 == OPTEE_SMC_RETURN_UNKNOWN_FUNCTION ) {
+        printk(XENLOG_ERR "Failed probe\n");
         return false;
+    }
 
     return true;
 }
@@ -341,6 +343,7 @@ static void map_xen_arg(struct optee_std_call *call)
     ASSERT(!call->xen_arg);
 
     call->xen_arg = __map_domain_page(call->xen_arg_pg);
+    gdprintk(XENLOG_WARNING, "xen_arg: %p, ma: 0x%"PRIpaddr"\n", (void *)call->xen_arg, __pa(call->xen_arg));
 }
 
 static void unmap_xen_arg(struct optee_std_call *call)
@@ -725,6 +728,8 @@ static int translate_noncontig(struct optee_domain *ctx,
         uint64_t next_page_data;
     } *guest_data, *xen_data;
 
+    gprintk(XENLOG_WARNING, "%s-line %d\n", __func__, __LINE__);
+
     /* Offset of user buffer withing OPTEE_MSG_NONCONTIG_PAGE_SIZE-sized page */
     offset = param->u.tmem.buf_ptr & (OPTEE_MSG_NONCONTIG_PAGE_SIZE - 1);
 
@@ -768,6 +773,9 @@ static int translate_noncontig(struct optee_domain *ctx,
     gfn = gaddr_to_gfn(param->u.tmem.buf_ptr &
                        ~(OPTEE_MSG_NONCONTIG_PAGE_SIZE - 1));
 
+    gdprintk(XENLOG_INFO, "offset: 0x%x, size: 0x%lx, pg_count: 0x%x, order: 0x%x\n",
+                 offset, size, pg_count, order);
+
     /*
      * We are initializing guest_pg, guest_data and xen_data with NULL
      * to make GCC 4.8 happy, as it can't infer that those variables
@@ -805,6 +813,9 @@ static int translate_noncontig(struct optee_domain *ctx,
         xen_data->pages_list[idx] = page_to_maddr(page);
         idx++;
 
+        gdprintk(XENLOG_INFO, "page_maddr: 0x%lx\n",
+                 xen_data->pages_list[idx]);
+
         if ( idx == PAGELIST_ENTRIES_PER_PAGE )
         {
             /* Roll over to the next page */
@@ -830,6 +841,9 @@ static int translate_noncontig(struct optee_domain *ctx,
     }
     param->u.tmem.buf_ptr = page_to_maddr(optee_shm_buf->pg_list) | offset;
 
+    gdprintk(XENLOG_INFO, "param_page_list: 0x%lx\n",
+                 param->u.tmem.buf_ptr);
+
     return 0;
 
 err_unmap:
@@ -848,9 +862,13 @@ static int translate_params(struct optee_domain *ctx,
     uint32_t attr;
     int ret = 0;
 
+	gprintk(XENLOG_WARNING, "%s-line %d\n", __func__, __LINE__);
+
     for ( i = 0; i < call->xen_arg->num_params; i++ )
     {
         attr = call->xen_arg->params[i].attr;
+
+        gprintk(XENLOG_WARNING, "%s-line %d, attr: 0x%x\n", __func__, __LINE__, attr);
 
         switch ( attr & OPTEE_MSG_ATTR_TYPE_MASK )
         {
@@ -859,9 +877,12 @@ static int translate_params(struct optee_domain *ctx,
         case OPTEE_MSG_ATTR_TYPE_TMEM_INOUT:
             if ( attr & OPTEE_MSG_ATTR_NONCONTIG )
             {
+				gprintk(XENLOG_WARNING, "%s-line %d\n", __func__, __LINE__);
                 ret = translate_noncontig(ctx, call, call->xen_arg->params + i);
-                if ( ret )
+                if ( ret ) {
+                    gprintk(XENLOG_WARNING, "%s-line %d, ret:%d\n", __func__, __LINE__, ret);
                     goto out;
+                }
             }
             else
             {
@@ -884,6 +905,7 @@ static int translate_params(struct optee_domain *ctx,
 out:
     if ( ret )
     {
+    	gprintk(XENLOG_WARNING, "%s-line %d, ret:%d\n", __func__, __LINE__, ret);
         call->xen_arg->ret_origin = TEEC_ORIGIN_COMMS;
         if ( ret == -ENOMEM )
             call->xen_arg->ret = TEEC_ERROR_OUT_OF_MEMORY;
@@ -904,6 +926,8 @@ static bool copy_std_request(struct cpu_user_regs *regs,
 {
     call->guest_arg_ipa = regpair_to_uint64(get_user_reg(regs, 1),
                                             get_user_reg(regs, 2));
+    gprintk(XENLOG_INFO, "parg_ipa %"PRIpaddr", x1: %"PRIregister", x2: %"PRIregister"\n",
+                    call->guest_arg_ipa, get_user_reg(regs, 1), get_user_reg(regs, 2));
 
     /*
      * Command buffer should start at page boundary.
@@ -1209,6 +1233,9 @@ static void handle_std_call(struct optee_domain *ctx,
         return;
     }
 
+    printk(" TTBR0_EL2: %016"PRIx64"\n", READ_SYSREG64(TTBR0_EL2));
+    printk(" VTTBR_EL2: %016"PRIx64"\n", READ_SYSREG64(VTTBR_EL2));
+
     if ( !copy_std_request(regs, call) )
         goto err;
 
@@ -1225,6 +1252,7 @@ static void handle_std_call(struct optee_domain *ctx,
         goto err;
     }
 
+    gdprintk(XENLOG_INFO, "std call cmd: %d\n", call->xen_arg->cmd);
     switch ( call->xen_arg->cmd )
     {
     case OPTEE_MSG_CMD_OPEN_SESSION:
@@ -1246,6 +1274,7 @@ static void handle_std_call(struct optee_domain *ctx,
         }
 
         xen_addr = page_to_maddr(call->xen_arg_pg);
+        gdprintk(XENLOG_INFO, "std call xen_addr: %"PRIpaddr"\n", xen_addr);
         uint64_to_regpair(&a1, &a2, xen_addr);
 
         do_call_with_arg(ctx, call, regs, OPTEE_SMC_CALL_WITH_ARG, a1, a2,
@@ -1613,16 +1642,22 @@ static bool optee_handle_call(struct cpu_user_regs *regs)
     struct arm_smccc_res resp;
     struct optee_domain *ctx = current->domain->arch.tee;
 
-    if ( !ctx )
+	gprintk(XENLOG_WARNING, "%s-line %d x0:0x%lx\n", __func__, __LINE__, get_user_reg(regs, 0));
+    if ( !ctx ) {
+        gprintk(XENLOG_WARNING, "%s-line %d- Null ctx\n", __func__, __LINE__);
         return false;
+    }
 
+//    switch ( get_user_reg(regs, 0) & 0xffffffff )
     switch ( get_user_reg(regs, 0) )
     {
     case OPTEE_SMC_CALLS_COUNT:
+        gprintk(XENLOG_WARNING, "%s-line %d-OPTEE_SMC_CALLS_COUNT\n", __func__, __LINE__);
         set_user_reg(regs, 0, OPTEE_MEDIATOR_SMC_COUNT);
         return true;
 
     case OPTEE_SMC_CALLS_UID:
+        gprintk(XENLOG_WARNING, "%s-line %d-OPTEE_SMC_CALLS_UID\n", __func__, __LINE__);
         arm_smccc_smc(OPTEE_SMC_CALLS_UID, 0, 0, 0, 0, 0, 0,
                       OPTEE_CLIENT_ID(current->domain), &resp);
         set_user_reg(regs, 0, resp.a0);
@@ -1632,6 +1667,7 @@ static bool optee_handle_call(struct cpu_user_regs *regs)
         return true;
 
     case OPTEE_SMC_CALLS_REVISION:
+        gprintk(XENLOG_WARNING, "%s-line %d-OPTEE_SMC_CALLS_REVISION\n", __func__, __LINE__);
         arm_smccc_smc(OPTEE_SMC_CALLS_REVISION, 0, 0, 0, 0, 0, 0,
                       OPTEE_CLIENT_ID(current->domain), &resp);
         set_user_reg(regs, 0, resp.a0);
@@ -1639,6 +1675,7 @@ static bool optee_handle_call(struct cpu_user_regs *regs)
         return true;
 
     case OPTEE_SMC_CALL_GET_OS_UUID:
+        gprintk(XENLOG_WARNING, "%s-line %d\n", __func__, __LINE__);
         arm_smccc_smc(OPTEE_SMC_CALL_GET_OS_UUID, 0, 0, 0, 0, 0, 0,
                       OPTEE_CLIENT_ID(current->domain),&resp);
         set_user_reg(regs, 0, resp.a0);
@@ -1648,6 +1685,7 @@ static bool optee_handle_call(struct cpu_user_regs *regs)
         return true;
 
     case OPTEE_SMC_CALL_GET_OS_REVISION:
+        gprintk(XENLOG_WARNING, "%s-line %d-OPTEE_SMC_CALL_GET_OS_REVISION\n", __func__, __LINE__);
         arm_smccc_smc(OPTEE_SMC_CALL_GET_OS_REVISION, 0, 0, 0, 0, 0, 0,
                       OPTEE_CLIENT_ID(current->domain), &resp);
         set_user_reg(regs, 0, resp.a0);
@@ -1655,12 +1693,14 @@ static bool optee_handle_call(struct cpu_user_regs *regs)
         return true;
 
     case OPTEE_SMC_ENABLE_SHM_CACHE:
+        gprintk(XENLOG_WARNING, "%s-line %d-OPTEE_SMC_ENABLE_SHM_CACHE\n", __func__, __LINE__);
         arm_smccc_smc(OPTEE_SMC_ENABLE_SHM_CACHE, 0, 0, 0, 0, 0, 0,
                       OPTEE_CLIENT_ID(current->domain), &resp);
         set_user_reg(regs, 0, resp.a0);
         return true;
 
     case OPTEE_SMC_DISABLE_SHM_CACHE:
+        gprintk(XENLOG_WARNING, "%s-line %d-OPTEE_SMC_DISABLE_SHM_CACHE\n", __func__, __LINE__);
         arm_smccc_smc(OPTEE_SMC_ENABLE_SHM_CACHE, 0, 0, 0, 0, 0, 0,
                       OPTEE_CLIENT_ID(current->domain), &resp);
         set_user_reg(regs, 0, resp.a0);
@@ -1672,19 +1712,23 @@ static bool optee_handle_call(struct cpu_user_regs *regs)
         return true;
 
     case OPTEE_SMC_GET_SHM_CONFIG:
+        gprintk(XENLOG_WARNING, "%s-line %d-OPTEE_SMC_GET_SHM_CONFIG\n", __func__, __LINE__);
         /* No static SHM available for guests */
         set_user_reg(regs, 0, OPTEE_SMC_RETURN_ENOTAVAIL);
         return true;
 
     case OPTEE_SMC_EXCHANGE_CAPABILITIES:
+        gprintk(XENLOG_WARNING, "%s-line %d-OPTEE_SMC_EXCHANGE_CAPABILITIES\n", __func__, __LINE__);
         handle_exchange_capabilities(regs);
         return true;
 
     case OPTEE_SMC_CALL_WITH_ARG:
+        gprintk(XENLOG_WARNING, "%s-line %d-OPTEE_SMC_CALL_WITH_ARG\n", __func__, __LINE__);
         handle_std_call(ctx, regs);
         return true;
 
     case OPTEE_SMC_CALL_RETURN_FROM_RPC:
+        gprintk(XENLOG_WARNING, "%s-line %d-OPTEE_SMC_CALL_RETURN_FROM_RPC\n", __func__, __LINE__);
         handle_rpc(ctx, regs);
         return true;
 
